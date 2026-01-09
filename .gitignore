@@ -3,3 +3,6 @@ obj/
 .vscode/
 nohup.out
 *.con
+venv/
+.cache/
+build/
