@@ -1,0 +1,12 @@
+[
+{
+  "directory": "/home/rying/qatradegateway/qactpmdgateway/build",
+  "command": "/usr/bin/c++   -I/home/rying/qatradegateway/qactpmdgateway/./libs -I/home/rying/qatradegateway/qactpmdgateway/../open-trade-common -I/home/rying/qatradegateway/qactpmdgateway/../contrib/include   -std=c++17 -pthread -g -O2 -Wall -fPIC   -std=gnu++17 -o CMakeFiles/market_data_server.dir/src/main.cpp.o -c /home/rying/qatradegateway/qactpmdgateway/src/main.cpp",
+  "file": "/home/rying/qatradegateway/qactpmdgateway/src/main.cpp"
+},
+{
+  "directory": "/home/rying/qatradegateway/qactpmdgateway/build",
+  "command": "/usr/bin/c++   -I/home/rying/qatradegateway/qactpmdgateway/./libs -I/home/rying/qatradegateway/qactpmdgateway/../open-trade-common -I/home/rying/qatradegateway/qactpmdgateway/../contrib/include   -std=c++17 -pthread -g -O2 -Wall -fPIC   -std=gnu++17 -o CMakeFiles/market_data_server.dir/src/market_data_server.cpp.o -c /home/rying/qatradegateway/qactpmdgateway/src/market_data_server.cpp",
+  "file": "/home/rying/qatradegateway/qactpmdgateway/src/market_data_server.cpp"
+}
+]

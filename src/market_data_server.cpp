@@ -1,0 +1,1592 @@
+#include "market_data_server.h"
+#include <boost/log/trivial.hpp>
+#include <sstream>
+#include <cstring>
+#include <chrono>
+#include <random>
+#include <algorithm>
+#include <cmath>
+#include <chrono>
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+
+// WebSocketSession实现
+WebSocketSession::WebSocketSession(tcp::socket&& socket, MarketDataServer* server)
+    : ws_(std::move(socket))
+    , server_(server)
+    , is_writing_(false)
+{
+    // 生成唯一的session ID
+    session_id_ = server_->create_session_id();
+}
+
+WebSocketSession::~WebSocketSession()
+{
+    if (server_) {
+        server_->remove_session(session_id_);
+    }
+}
+
+void WebSocketSession::run()
+{
+    // 设置WebSocket选项
+    ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+    ws_.set_option(websocket::stream_base::decorator(
+        [](websocket::response_type& res)
+        {
+            res.set(http::field::server, "QuantAxis-MarketData-Server");
+        }));
+
+    // 接受WebSocket握手
+    ws_.async_accept(
+        beast::bind_front_handler(&WebSocketSession::on_accept, shared_from_this()));
+}
+
+void WebSocketSession::on_accept(beast::error_code ec)
+{
+    if (ec) {
+        server_->log_error("WebSocket accept error: " + ec.message());
+        return;
+    }
+
+    server_->log_info("WebSocket session connected: " + session_id_);
+    
+    // 发送欢迎消息
+    rapidjson::Document welcome;
+    welcome.SetObject();
+    rapidjson::Document::AllocatorType& allocator = welcome.GetAllocator();
+    
+    welcome.AddMember("type", "welcome", allocator);
+    welcome.AddMember("message", "Connected to QuantAxis MarketData Server", allocator);
+    welcome.AddMember("session_id", rapidjson::StringRef(session_id_.c_str()), allocator);
+    welcome.AddMember("ctp_connected", server_->is_ctp_connected(), allocator);
+    welcome.AddMember("timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(), allocator);
+    
+    send_response("welcome", welcome);
+    
+    // 开始读取消息
+    do_read();
+}
+
+void WebSocketSession::do_read()
+{
+    ws_.async_read(
+        buffer_,
+        beast::bind_front_handler(&WebSocketSession::on_read, shared_from_this()));
+}
+
+void WebSocketSession::on_read(beast::error_code ec, std::size_t bytes_transferred)
+{
+    boost::ignore_unused(bytes_transferred);
+
+    if (ec == websocket::error::closed) {
+        server_->log_info("WebSocket session closed: " + session_id_);
+        server_->remove_session(session_id_);
+        return;
+    }
+
+    if (ec) {
+        server_->log_error("WebSocket read error: " + ec.message());
+        return;
+    }
+
+    // 处理接收到的消息
+    std::string message = beast::buffers_to_string(buffer_.data());
+    buffer_.clear();
+    
+    handle_message(message);
+    do_read();
+}
+
+void WebSocketSession::handle_message(const std::string& message)
+{
+    server_->log_info("Received message from session " + session_id_ + ": " + message);
+    
+    try {
+        rapidjson::Document doc;
+        if (doc.Parse(message.c_str()).HasParseError()) {
+            send_error("Invalid JSON format");
+            return;
+        }
+        
+        // 兼容mdservice协议
+        if (doc.HasMember("aid") && doc["aid"].IsString()) {
+            std::string aid = doc["aid"].GetString();
+            
+            if (aid == "subscribe_quote") {
+                // 处理mdservice订阅请求
+                if (!doc.HasMember("ins_list") || !doc["ins_list"].IsString()) {
+                    send_error("Missing or invalid 'ins_list' field");
+                    return;
+                }
+                
+                std::string ins_list = doc["ins_list"].GetString();
+                std::vector<std::string> instruments;
+                
+                // 解析逗号分隔的合约列表
+                std::istringstream iss(ins_list);
+                std::string instrument;
+                while (std::getline(iss, instrument, ',')) {
+                    if (!instrument.empty()) {
+                        // 去掉交易所前缀 (如 GFEX. -> 空)
+                        std::string nohead_instrument = instrument;
+                        size_t dot_pos = instrument.find('.');
+                        if (dot_pos != std::string::npos) {
+                            nohead_instrument = instrument.substr(dot_pos + 1);
+                        }
+                        
+                        instruments.push_back(nohead_instrument);
+                        subscriptions_.insert(nohead_instrument);
+                        
+                        // 更新映射表和订阅者
+                        server_->noheadtohead_instruments_map_[nohead_instrument] = instrument;
+                        server_->subscribe_instrument(session_id_, nohead_instrument);  // 使用CTP格式订阅
+                    }
+                }
+                
+                // 发送mdservice格式响应
+                rapidjson::Document response;
+                response.SetObject();
+                auto& allocator = response.GetAllocator();
+                response.AddMember("aid", "subscribe_quote", allocator);
+                response.AddMember("status", "ok", allocator);
+                
+                send_response("subscribe_quote_response", response);
+                return;
+            }
+            if (aid == "peek_message") {
+                // 处理peek_message，发送缓存的行情数据
+                server_->handle_peek_message(session_id_);
+                return;
+            }
+        }
+    } catch (const std::exception& e) {
+        send_error("Error processing message: " + std::string(e.what()));
+    }
+}
+
+void WebSocketSession::send_error(const std::string& error_msg)
+{
+    rapidjson::Document error;
+    error.SetObject();
+    auto& allocator = error.GetAllocator();
+    error.AddMember("type", "error", allocator);
+    error.AddMember("message", rapidjson::StringRef(error_msg.c_str()), allocator);
+    error.AddMember("timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(), allocator);
+    
+    send_response("error", error);
+}
+
+void WebSocketSession::send_response(const std::string& type, const rapidjson::Document& data)
+{
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    data.Accept(writer);
+    
+    send_message(buffer.GetString());
+}
+
+void WebSocketSession::send_message(const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    
+    message_queue_.push(message);
+    
+    if (!is_writing_) {
+        is_writing_ = true;
+        start_write();
+    }
+}
+
+void WebSocketSession::start_write()
+{
+    if (message_queue_.empty()) {
+        is_writing_ = false;
+        return;
+    }
+
+    current_write_message_ = std::move(message_queue_.front());
+    message_queue_.pop();
+
+    ws_.async_write(
+        net::buffer(current_write_message_),
+        beast::bind_front_handler(&WebSocketSession::on_write, shared_from_this()));
+}
+
+void WebSocketSession::on_write(beast::error_code ec, std::size_t bytes_transferred)
+{
+    boost::ignore_unused(bytes_transferred);
+
+    if (ec) {
+        server_->log_error("WebSocket write error: " + ec.message());
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        is_writing_ = false;
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    
+    // 继续写入队列中的下一条消息
+    start_write();
+}
+
+void WebSocketSession::close()
+{
+    beast::error_code ec;
+    ws_.close(websocket::close_code::normal, ec);
+    if (ec) {
+        server_->log_error("Error closing WebSocket: " + ec.message());
+    }
+}
+
+// MarketDataSpi实现
+MarketDataSpi::MarketDataSpi(MarketDataServer* server) : server_(server)
+{
+}
+
+MarketDataSpi::~MarketDataSpi()
+{
+}
+
+void MarketDataSpi::OnFrontConnected()
+{
+    server_->log_info("CTP front connected");
+    server_->ctp_login();
+}
+
+void MarketDataSpi::OnFrontDisconnected(int nReason)
+{
+    server_->log_warning("CTP front disconnected, reason: " + std::to_string(nReason));
+}
+
+void MarketDataSpi::OnRspUserLogin(CThostFtdcRspUserLoginField *pRspUserLogin,
+                                  CThostFtdcRspInfoField *pRspInfo,
+                                  int nRequestID, bool bIsLast)
+{
+    if (pRspInfo && pRspInfo->ErrorID != 0) {
+        server_->log_error("CTP login failed: " + std::string(pRspInfo->ErrorMsg));
+        return;
+    }
+    
+    server_->log_info("CTP login successful");
+}
+
+void MarketDataSpi::OnRspSubMarketData(CThostFtdcSpecificInstrumentField *pSpecificInstrument,
+                                      CThostFtdcRspInfoField *pRspInfo,
+                                      int nRequestID, bool bIsLast)
+{
+    if (pRspInfo && pRspInfo->ErrorID != 0) {
+        server_->log_error("Subscribe market data failed: " + std::string(pRspInfo->ErrorMsg));
+        return;
+    }
+    
+    if (pSpecificInstrument) {
+        server_->log_info("Subscribed to instrument: " + std::string(pSpecificInstrument->InstrumentID));
+    }
+}
+
+// 从CTP数据构建MarketDataStruct
+MarketDataStruct MarketDataServer::build_market_data_struct(CThostFtdcDepthMarketDataField *pDepthMarketData,
+                                                             const std::string& display_instrument,
+                                                             const uint64_t cur_time)
+{
+    if (!pDepthMarketData) {
+        MarketDataStruct empty;
+        memset(&empty, 0, sizeof(empty));
+        return empty;
+    }
+    MarketDataStruct data;
+    memset(&data, 0, sizeof(data));
+    
+    // 复制instrument_id
+    strncpy(data.instrument_id, display_instrument.c_str(), sizeof(data.instrument_id) - 1);
+    data.instrument_id[sizeof(data.instrument_id) - 1] = '\0';
+    
+    // 构建datetime字符串
+    std::ostringstream oss;
+    std::string trading_day = pDepthMarketData->TradingDay;
+    if (trading_day.size() >= 8) {
+        oss << trading_day.substr(0, 4) << "-"
+            << trading_day.substr(4, 2) << "-"
+            << trading_day.substr(6, 2);
+    } else {
+        oss << trading_day;
+    }
+    oss << " " << pDepthMarketData->UpdateTime << "." << pDepthMarketData->UpdateMillisec;
+    std::string datetime_str = oss.str();
+    strncpy(data.datetime, datetime_str.c_str(), sizeof(data.datetime) - 1);
+    data.datetime[sizeof(data.datetime) - 1] = '\0';
+    
+    data.timestamp = cur_time;
+    
+    // 初始化数组为0
+    for (int i = 0; i < 10; ++i) {
+        data.ask_price[i] = 0.0;
+        data.ask_volume[i] = 0;
+        data.bid_price[i] = 0.0;
+        data.bid_volume[i] = 0;
+    }
+    
+    // Ask 5-1
+    double ask5 = pDepthMarketData->AskPrice5;
+    if (ask5 > 1e-6 && ask5 < 1e300) {
+        data.ask_price[4] = round(ask5 * 100.0) / 100.0;
+        data.ask_volume[4] = pDepthMarketData->AskVolume5;
+    }
+    
+    double ask4 = pDepthMarketData->AskPrice4;
+    if (ask4 > 1e-6 && ask4 < 1e300) {
+        data.ask_price[3] = round(ask4 * 100.0) / 100.0;
+        data.ask_volume[3] = pDepthMarketData->AskVolume4;
+    }
+    
+    double ask3 = pDepthMarketData->AskPrice3;
+    if (ask3 > 1e-6 && ask3 < 1e300) {
+        data.ask_price[2] = round(ask3 * 100.0) / 100.0;
+        data.ask_volume[2] = pDepthMarketData->AskVolume3;
+    }
+    
+    double ask2 = pDepthMarketData->AskPrice2;
+    if (ask2 > 1e-6 && ask2 < 1e300) {
+        data.ask_price[1] = round(ask2 * 100.0) / 100.0;
+        data.ask_volume[1] = pDepthMarketData->AskVolume2;
+    }
+    
+    double ask1 = pDepthMarketData->AskPrice1;
+    if (ask1 > 1e-6 && ask1 < 1e300) {
+        data.ask_price[0] = round(ask1 * 100.0) / 100.0;
+        data.ask_volume[0] = pDepthMarketData->AskVolume1;
+    }
+    
+    // Bid 1-5
+    double bid1 = pDepthMarketData->BidPrice1;
+    if (bid1 > 1e-6 && bid1 < 1e300) {
+        data.bid_price[0] = round(bid1 * 100.0) / 100.0;
+        data.bid_volume[0] = pDepthMarketData->BidVolume1;
+    }
+    
+    double bid2 = pDepthMarketData->BidPrice2;
+    if (bid2 > 1e-6 && bid2 < 1e300) {
+        data.bid_price[1] = round(bid2 * 100.0) / 100.0;
+        data.bid_volume[1] = pDepthMarketData->BidVolume2;
+    }
+    
+    double bid3 = pDepthMarketData->BidPrice3;
+    if (bid3 > 1e-6 && bid3 < 1e300) {
+        data.bid_price[2] = round(bid3 * 100.0) / 100.0;
+        data.bid_volume[2] = pDepthMarketData->BidVolume3;
+    }
+    
+    double bid4 = pDepthMarketData->BidPrice4;
+    if (bid4 > 1e-6 && bid4 < 1e300) {
+        data.bid_price[3] = round(bid4 * 100.0) / 100.0;
+        data.bid_volume[3] = pDepthMarketData->BidVolume4;
+    }
+    
+    double bid5 = pDepthMarketData->BidPrice5;
+    if (bid5 > 1e-6 && bid5 < 1e300) {
+        data.bid_price[4] = round(bid5 * 100.0) / 100.0;
+        data.bid_volume[4] = pDepthMarketData->BidVolume5;
+    }
+    
+    // 其他价格字段
+    double last_price = pDepthMarketData->LastPrice;
+    if (last_price > 1e-6 && last_price < 1e300) {
+        data.last_price = round(last_price * 100.0) / 100.0;
+    }
+    
+    double highest = pDepthMarketData->HighestPrice;
+    if (highest > 1e-6 && highest < 1e300) {
+        data.highest = round(highest * 100.0) / 100.0;
+    }
+    
+    double lowest = pDepthMarketData->LowestPrice;
+    if (lowest > 1e-6 && lowest < 1e300) {
+        data.lowest = round(lowest * 100.0) / 100.0;
+    }
+    
+    double open = pDepthMarketData->OpenPrice;
+    if (open > 1e-6 && open < 1e300) {
+        data.open = round(open * 100.0) / 100.0;
+    }
+    
+    double close = pDepthMarketData->ClosePrice;
+    if (close > 1e-6 && close < 1e300) {
+        data.close = round(close * 100.0) / 100.0;
+    }
+    
+    data.volume = pDepthMarketData->Volume;
+    data.amount = pDepthMarketData->Turnover;
+    data.open_interest = static_cast<int64_t>(pDepthMarketData->OpenInterest);
+    
+    double settlement = pDepthMarketData->SettlementPrice;
+    if (settlement > 1e-6 && settlement < 1e300) {
+        data.settlement = round(settlement * 100.0) / 100.0;
+    }
+    
+    double upper_limit = pDepthMarketData->UpperLimitPrice;
+    if (upper_limit > 1e-6 && upper_limit < 1e300) {
+        data.upper_limit = round(upper_limit * 100.0) / 100.0;
+    }
+    
+    double lower_limit = pDepthMarketData->LowerLimitPrice;
+    if (lower_limit > 1e-6 && lower_limit < 1e300) {
+        data.lower_limit = round(lower_limit * 100.0) / 100.0;
+    }
+    
+    data.pre_open_interest = static_cast<int64_t>(pDepthMarketData->PreOpenInterest);
+    
+    double pre_settlement = pDepthMarketData->PreSettlementPrice;
+    if (pre_settlement > 1e-6 && pre_settlement < 1e300) {
+        data.pre_settlement = round(pre_settlement * 100.0) / 100.0;
+    }
+    
+    double pre_close = pDepthMarketData->PreClosePrice;
+    if (pre_close > 1e-6 && pre_close < 1e300) {
+        data.pre_close = round(pre_close * 100.0) / 100.0;
+    }
+    
+    return data;
+}
+
+// 从MarketDataStruct构建JSON（用于发送）
+rapidjson::Value MarketDataServer::struct_to_json(const MarketDataStruct& data,
+                                                  rapidjson::Document::AllocatorType& allocator)
+{
+    rapidjson::Value inst_data(rapidjson::kObjectType);
+    inst_data.AddMember("instrument_id", rapidjson::Value(data.instrument_id, allocator), allocator);
+    inst_data.AddMember("datetime", rapidjson::Value(data.datetime, allocator), allocator);
+    inst_data.AddMember("timestamp", data.timestamp, allocator);
+    
+    // Ask 10-1 (10-6为null)
+    inst_data.AddMember("ask_price10", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_volume10", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_price9", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_volume9", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_price8", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_volume8", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_price7", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_volume7", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_price6", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("ask_volume6", rapidjson::Value().SetNull(), allocator);
+    
+    for (int i = 4; i >= 0; --i) {
+        std::string price_key = "ask_price" + std::to_string(i + 1);
+        std::string volume_key = "ask_volume" + std::to_string(i + 1);
+        rapidjson::Value price_key_value(price_key.c_str(), allocator);
+        rapidjson::Value volume_key_value(volume_key.c_str(), allocator);
+        inst_data.AddMember(price_key_value, data.ask_price[i], allocator);
+        inst_data.AddMember(volume_key_value, data.ask_volume[i], allocator);
+    }
+    
+    // Bid 1-5
+    for (int i = 0; i < 5; ++i) {
+        std::string price_key = "bid_price" + std::to_string(i + 1);
+        std::string volume_key = "bid_volume" + std::to_string(i + 1);
+        rapidjson::Value price_key_value(price_key.c_str(), allocator);
+        rapidjson::Value volume_key_value(volume_key.c_str(), allocator);
+        inst_data.AddMember(price_key_value, data.bid_price[i], allocator);
+        inst_data.AddMember(volume_key_value, data.bid_volume[i], allocator);
+    }
+    
+    // Bid 6-10为null
+    inst_data.AddMember("bid_price6", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_volume6", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_price7", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_volume7", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_price8", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_volume8", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_price9", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_volume9", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_price10", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("bid_volume10", rapidjson::Value().SetNull(), allocator);
+    
+    // 其他字段
+    inst_data.AddMember("last_price", data.last_price, allocator);
+    inst_data.AddMember("highest", data.highest, allocator);
+    inst_data.AddMember("lowest", data.lowest, allocator);
+    inst_data.AddMember("open", data.open, allocator);
+    inst_data.AddMember("close", data.close, allocator);
+    
+    inst_data.AddMember("average", rapidjson::Value().SetNull(), allocator);
+    inst_data.AddMember("volume", data.volume, allocator);
+    inst_data.AddMember("amount", data.amount, allocator);
+    inst_data.AddMember("open_interest", data.open_interest, allocator);
+    
+    inst_data.AddMember("settlement", data.settlement, allocator);
+    inst_data.AddMember("upper_limit", data.upper_limit, allocator);
+    inst_data.AddMember("lower_limit", data.lower_limit, allocator);
+    
+    inst_data.AddMember("pre_open_interest", data.pre_open_interest, allocator);
+    
+    inst_data.AddMember("pre_settlement", data.pre_settlement, allocator);
+    inst_data.AddMember("pre_close", data.pre_close, allocator);
+    
+    return inst_data;
+}
+
+// 结构体字段级比较，返回差异字段的JSON
+void MarketDataServer::compute_struct_diff(const MarketDataStruct& old_data,
+                                          const MarketDataStruct& new_data,
+                                          rapidjson::Value& diff_val,
+                                          rapidjson::Document::AllocatorType& allocator)
+{
+    diff_val.SetObject();
+    
+    // 比较基本字段
+    if (strcmp(old_data.instrument_id, new_data.instrument_id) != 0) {
+        diff_val.AddMember("instrument_id", rapidjson::Value(new_data.instrument_id, allocator), allocator);
+    }
+    
+    if (strcmp(old_data.datetime, new_data.datetime) != 0) {
+        diff_val.AddMember("datetime", rapidjson::Value(new_data.datetime, allocator), allocator);
+    }
+    
+    if (old_data.timestamp != new_data.timestamp) {
+        diff_val.AddMember("timestamp", new_data.timestamp, allocator);
+    }
+    
+    // 比较Ask价格和量
+    for (int i = 0; i < 10; ++i) {
+        std::string price_key = "ask_price" + std::to_string(i + 1);
+        std::string volume_key = "ask_volume" + std::to_string(i + 1);
+        if (old_data.ask_price[i] != new_data.ask_price[i]) {
+            rapidjson::Value price_key_value(price_key.c_str(), allocator);
+            diff_val.AddMember(price_key_value, new_data.ask_price[i], allocator);
+        }
+        if (old_data.ask_volume[i] != new_data.ask_volume[i]) {
+            rapidjson::Value volume_key_value(volume_key.c_str(), allocator);
+            diff_val.AddMember(volume_key_value, new_data.ask_volume[i], allocator);
+        }
+    }
+    
+    // 比较Bid价格和量
+    for (int i = 0; i < 10; ++i) {
+        std::string price_key = "bid_price" + std::to_string(i + 1);
+        std::string volume_key = "bid_volume" + std::to_string(i + 1);
+        if (old_data.bid_price[i] != new_data.bid_price[i]) {
+            rapidjson::Value price_key_value(price_key.c_str(), allocator);
+            diff_val.AddMember(price_key_value, new_data.bid_price[i], allocator);
+        }
+        if (old_data.bid_volume[i] != new_data.bid_volume[i]) {
+            rapidjson::Value volume_key_value(volume_key.c_str(), allocator);
+            diff_val.AddMember(volume_key_value, new_data.bid_volume[i], allocator);
+        }
+    }
+    
+    // 比较其他价格字段
+    auto add_price_diff = [&](const char* key, double old_val, double new_val) {
+        if (old_val != new_val) {
+            rapidjson::Value key_value(key, allocator);
+            rapidjson::Value value(new_val);
+            diff_val.AddMember(key_value, value, allocator);
+        }
+    };
+    
+    add_price_diff("last_price", old_data.last_price, new_data.last_price);
+    add_price_diff("highest", old_data.highest, new_data.highest);
+    add_price_diff("lowest", old_data.lowest, new_data.lowest);
+    add_price_diff("open", old_data.open, new_data.open);
+    add_price_diff("close", old_data.close, new_data.close);
+    add_price_diff("upper_limit", old_data.upper_limit, new_data.upper_limit);
+    add_price_diff("lower_limit", old_data.lower_limit, new_data.lower_limit);
+    add_price_diff("pre_settlement", old_data.pre_settlement, new_data.pre_settlement);
+    add_price_diff("pre_close", old_data.pre_close, new_data.pre_close);
+    add_price_diff("settlement", old_data.settlement, new_data.settlement);
+    
+    // 比较整数字段
+    if (old_data.volume != new_data.volume) {
+        diff_val.AddMember("volume", new_data.volume, allocator);
+    }
+    
+    if (old_data.amount != new_data.amount) {
+        diff_val.AddMember("amount", new_data.amount, allocator);
+    }
+    
+    if (old_data.open_interest != new_data.open_interest) {
+        diff_val.AddMember("open_interest", new_data.open_interest, allocator);
+    }
+    
+    if (old_data.pre_open_interest != new_data.pre_open_interest) {
+        diff_val.AddMember("pre_open_interest", new_data.pre_open_interest, allocator);
+    }
+}
+
+void MarketDataSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthMarketData)
+{
+    if (!pDepthMarketData) return;
+
+    auto cur_time = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // Debug打印行情数据接收信息
+    server_->log_info("DEBUG: Received market data for instrument: " + std::string(pDepthMarketData->InstrumentID) + 
+                     ", price: " + std::to_string(pDepthMarketData->LastPrice) + 
+                     ", volume: " + std::to_string(pDepthMarketData->Volume));
+    
+    std::string instrument_id = pDepthMarketData->InstrumentID;
+    
+    // 通过映射表查找带前缀的格式
+    auto map_it = server_->noheadtohead_instruments_map_.find(instrument_id);
+    std::string display_instrument = (map_it != server_->noheadtohead_instruments_map_.end()) 
+        ? map_it->second : instrument_id;
+    
+    // 直接构建结构体（避免JSON构建，提高回调线程性能）
+    MarketDataStruct market_data = MarketDataServer::build_market_data_struct(pDepthMarketData, display_instrument, cur_time);
+    
+    // 缓存行情数据（使用结构体存储）
+    server_->cache_market_data(instrument_id, market_data, display_instrument);
+    
+    // 通知线性合约管理器组件行情更新（使用结构体传递）
+    server_->on_component_update(instrument_id, market_data);
+}
+
+void MarketDataSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast)
+{
+    if (pRspInfo && pRspInfo->ErrorID != 0) {
+        server_->log_error("CTP error: " + std::string(pRspInfo->ErrorMsg));
+    }
+}
+
+// MarketDataServer实现
+MarketDataServer::MarketDataServer(const std::string& ctp_front_addr,
+                                 const std::string& broker_id,
+                                 int websocket_port)
+    : ctp_front_addr_(ctp_front_addr)
+    , broker_id_(broker_id)
+    , ioc_()
+    , websocket_port_(websocket_port)
+    , ctp_api_(nullptr)
+    , ctp_connected_(false)
+    , ctp_logged_in_(false)
+    , acceptor_(ioc_)
+    , segment_(nullptr)
+    , alloc_inst_(nullptr)
+    , ins_map_(nullptr)
+    , use_multi_ctp_mode_(false)
+    , is_running_(false)
+    , request_id_(0)
+{
+}
+
+MarketDataServer::MarketDataServer(const MultiCTPConfig& config)
+    : broker_id_(config.connections.empty() ? "9999" : config.connections[0].broker_id)
+    , ioc_()
+    , websocket_port_(config.websocket_port)
+    , ctp_api_(nullptr)
+    , ctp_connected_(false)
+    , ctp_logged_in_(false)
+    , acceptor_(ioc_)
+    , segment_(nullptr)
+    , alloc_inst_(nullptr)
+    , ins_map_(nullptr)
+    , multi_ctp_config_(config)
+    , use_multi_ctp_mode_(true)
+    , is_running_(false)
+    , request_id_(0)
+{
+}
+
+MarketDataServer::~MarketDataServer()
+{
+    stop();
+}
+
+bool MarketDataServer::start()
+{
+    if (is_running_) {
+        return true;
+    }
+    
+    std::string mode = use_multi_ctp_mode_ ? "multi-CTP" : "single-CTP";
+    log_info("Starting MarketData Server in " + mode + " mode...");
+    
+    try {
+        // 初始化共享内存
+        init_shared_memory();
+        
+        // 启动WebSocket服务器
+        start_websocket_server();
+        
+        if (use_multi_ctp_mode_) {
+            // 多CTP连接模式
+            if (!init_multi_ctp_system()) {
+                log_error("Failed to initialize multi-CTP system");
+                return false;
+            }
+        } else {
+            // 单CTP连接模式（兼容性）
+            std::string flow_path = "./ctpflow/single/";
+            
+            // 确保flow目录存在
+            std::string mkdir_cmd = "mkdir -p " + flow_path;
+            if (system(mkdir_cmd.c_str()) != 0) {
+                log_warning("Failed to create flow directory: " + flow_path);
+            }
+            
+            ctp_api_ = CThostFtdcMdApi::CreateFtdcMdApi(flow_path.c_str());
+            if (!ctp_api_) {
+                log_error("Failed to create CTP API");
+                return false;
+            }
+            
+            md_spi_ = std::make_unique<MarketDataSpi>(this);
+            ctp_api_->RegisterSpi(md_spi_.get());
+            ctp_api_->RegisterFront(const_cast<char*>(ctp_front_addr_.c_str()));
+            ctp_api_->Init(); 
+        }
+        
+        is_running_ = true;
+        
+        // 启动服务器线程
+        server_thread_ = boost::thread([this]() {
+            ioc_.run();
+        });
+        
+        log_info("MarketData Server started on port " + std::to_string(websocket_port_));
+        return true;
+        
+    } catch (const std::exception& e) {
+        log_error("Failed to start server: " + std::string(e.what()));
+        return false;
+    }
+}
+
+void MarketDataServer::stop()
+{
+    if (!is_running_) {
+        return;
+    }
+    
+    log_info("Stopping MarketData Server...");
+    is_running_ = false;
+    
+    // 关闭acceptor
+    if (acceptor_.is_open()) {
+        boost::system::error_code ec;
+        acceptor_.cancel(ec); 
+        acceptor_.close(ec);
+        if (ec) {
+            log_error("Failed to close acceptor: " + ec.message());
+        } else {
+            log_info("Acceptor closed successfully");
+        }
+    }
+    
+    // 关闭所有WebSocket连接
+    {
+        std::map<std::string, std::shared_ptr<WebSocketSession>> sessions_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            sessions_snapshot = sessions_;
+            sessions_.clear();
+        }
+        
+        for (auto& pair : sessions_snapshot) {
+            pair.second->close();
+        }
+        sessions_snapshot.clear();
+    }
+    
+    // 停止IO上下文
+    ioc_.stop();
+    
+    // 等待服务器线程结束
+    if (server_thread_.joinable()) {
+        server_thread_.join();
+    }
+    
+    // 清理CTP资源
+    if (ctp_api_) {
+        ctp_api_->Release();
+        ctp_api_ = nullptr;
+    }
+
+    cleanup_shared_memory();
+    if (use_multi_ctp_mode_) {
+        cleanup_multi_ctp_system();
+    }
+    
+    log_info("MarketData Server stopped");
+}
+
+void MarketDataServer::init_shared_memory()
+{
+    try {
+        // 尝试连接到现有的共享内存段
+        segment_ = new boost::interprocess::managed_shared_memory(
+            boost::interprocess::open_only, "qamddata");
+        
+        alloc_inst_ = new ShmemAllocator(segment_->get_segment_manager());
+        ins_map_ = segment_->find<InsMapType>("InsMap").first;
+        
+        if (ins_map_) {
+            log_info("Connected to existing shared memory segment with " + 
+                    std::to_string(ins_map_->size()) + " instruments");
+        } else {
+            log_warning("Shared memory segment found but InsMap not found");
+        }
+        
+    } catch (const boost::interprocess::interprocess_exception& e) {
+        log_warning("Failed to connect to existing shared memory: " + std::string(e.what()));
+        log_info("Creating new shared memory segment");
+        
+        try {
+            boost::interprocess::shared_memory_object::remove("qamddata");
+            
+            segment_ = new boost::interprocess::managed_shared_memory(
+                boost::interprocess::create_only,
+                "qamddata",
+                32 * 1024 * 1024);  // 32MB
+            
+            alloc_inst_ = new ShmemAllocator(segment_->get_segment_manager());
+            ins_map_ = segment_->construct<InsMapType>("InsMap")(
+                CharArrayComparer(), *alloc_inst_);
+            
+            log_info("Created new shared memory segment");
+            
+        } catch (const std::exception& e) {
+            log_error("Failed to create shared memory: " + std::string(e.what()));
+            throw;
+        }
+    }
+}
+
+void MarketDataServer::cleanup_shared_memory()
+{
+    if (alloc_inst_) {
+        delete alloc_inst_;
+        alloc_inst_ = nullptr;
+    }
+    
+    if (segment_) {
+        delete segment_;
+        segment_ = nullptr;
+    }
+    
+    ins_map_ = nullptr;
+}
+
+void MarketDataServer::start_websocket_server()
+{
+    auto const address = net::ip::make_address("0.0.0.0");
+    auto const port = static_cast<unsigned short>(websocket_port_);
+    
+    tcp::endpoint endpoint{address, port};
+    acceptor_.open(endpoint.protocol());
+    acceptor_.set_option(net::socket_base::reuse_address(true));
+    acceptor_.bind(endpoint);
+    acceptor_.listen(net::socket_base::max_listen_connections);
+    
+    // 开始接受连接
+    acceptor_.async_accept(
+        net::make_strand(ioc_),
+        beast::bind_front_handler(&MarketDataServer::handle_accept, this));
+}
+
+void MarketDataServer::handle_accept(beast::error_code ec, tcp::socket socket)
+{
+    if(!acceptor_.is_open()) {
+        return;
+    }
+    if (ec) {
+        log_error("Accept error: " + ec.message());
+    } else {
+        // 创建新的会话
+        auto session = std::make_shared<WebSocketSession>(std::move(socket), this);
+        add_session(session);
+        session->run();
+    }
+    
+    // 继续接受连接
+    acceptor_.async_accept(
+        net::make_strand(ioc_),
+        beast::bind_front_handler(&MarketDataServer::handle_accept, this));
+}
+
+void MarketDataServer::ctp_login()
+{
+    CThostFtdcReqUserLoginField req;
+    memset(&req, 0, sizeof(req));
+    
+    // 行情API登录只需要BrokerID，不需要用户名和密码
+    strcpy(req.BrokerID, broker_id_.c_str());
+    // 行情登录可以使用空的用户ID和密码
+    strcpy(req.UserID, "");
+    strcpy(req.Password, "");
+    
+    int ret = ctp_api_->ReqUserLogin(&req, ++request_id_);
+    if (ret != 0) {
+        log_error("Failed to send market data login request, return code: " + std::to_string(ret));
+    } else {
+        ctp_connected_ = true;
+        ctp_logged_in_ = true;
+        log_info("Market data login request sent");
+    }
+}
+
+std::string MarketDataServer::create_session_id()
+{
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(100000, 999999);
+    
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    
+    std::ostringstream oss;
+    oss << "session_" << time_t << "_" << ms.count() << "_" << dis(gen);
+    return oss.str();
+}
+
+void MarketDataServer::add_session(std::shared_ptr<WebSocketSession> session)
+{
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    sessions_[session->get_session_id()] = session;
+}
+
+void MarketDataServer::remove_session(const std::string& session_id)
+{
+    if (use_multi_ctp_mode_) {
+        // 多CTP连接模式：使用订阅分发器
+        if (subscription_dispatcher_) {
+            subscription_dispatcher_->remove_all_subscriptions_for_session(session_id);
+        }
+    } else {
+        // 单CTP连接模式（兼容性）
+        std::lock_guard<std::mutex> lock2(subscribers_mutex_);
+        
+        auto it = sessions_.find(session_id);
+        if (it != sessions_.end()) {
+            // 移除该会话的所有订阅
+            const auto& subscriptions = it->second->get_subscriptions();
+            for (const auto& instrument_id : subscriptions) {
+                auto sub_it = instrument_subscribers_.find(instrument_id);
+                if (sub_it != instrument_subscribers_.end()) {
+                    sub_it->second.erase(session_id);
+                    // 如果没有会话订阅该合约了，从CTP取消订阅
+                    if (sub_it->second.empty()) {
+                        instrument_subscribers_.erase(sub_it);
+                        
+                        if (ctp_api_ && ctp_logged_in_) {
+                            char* instruments[] = {const_cast<char*>(instrument_id.c_str())};
+                            int ret = ctp_api_->UnSubscribeMarketData(instruments, 1);
+                            if (ret == 0) {
+                                log_info("Auto-unsubscribed from CTP market data: " + instrument_id + 
+                                       " (session disconnected)");
+                            } else {
+                                log_error("Failed to auto-unsubscribe from CTP market data: " + instrument_id +
+                                         ", return code: " + std::to_string(ret));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 通用的session移除逻辑
+    std::lock_guard<std::mutex> lock1(sessions_mutex_);
+    auto it = sessions_.find(session_id);
+    if (it != sessions_.end()) {
+        sessions_.erase(it);
+        log_info("Session removed: " + session_id);
+    }
+    
+    // 清理上次发送的快照和版本号
+    {
+        std::lock_guard<std::mutex> lock_json(session_last_sent_mutex_);
+        session_last_sent_structs_.erase(session_id);
+        session_last_versions_.erase(session_id);
+    }
+    
+    // 清理挂起队列
+    {
+        std::lock_guard<std::mutex> lock_pending(pending_peek_mutex_);
+        pending_peek_sessions_.erase(session_id);
+    }
+}
+
+void MarketDataServer::subscribe_instrument(const std::string& session_id, const std::string& instrument_id)
+{
+    if (use_multi_ctp_mode_) {
+        // 多CTP连接模式：使用订阅分发器
+        if (subscription_dispatcher_) {
+            subscription_dispatcher_->add_subscription(session_id, instrument_id);
+        }
+        
+        // 同时维护instrument_subscribers_映射以支持broadcast_market_data
+        {
+            std::lock_guard<std::mutex> lock(subscribers_mutex_);
+            instrument_subscribers_[instrument_id].insert(session_id);
+        }
+    } else {
+        // 单CTP连接模式（兼容性）
+        std::lock_guard<std::mutex> lock(subscribers_mutex_);
+        
+        instrument_subscribers_[instrument_id].insert(session_id);
+        
+        // 如果这是第一个订阅该合约的会话，向CTP订阅行情
+        if (instrument_subscribers_[instrument_id].size() == 1 && ctp_api_ && ctp_logged_in_) {
+            char* instruments[] = {const_cast<char*>(instrument_id.c_str())};
+            int ret = ctp_api_->SubscribeMarketData(instruments, 1);
+            if (ret == 0) {
+                log_info("Subscribed to CTP market data: " + instrument_id);
+            } else {
+                log_error("Failed to subscribe to CTP market data: " + instrument_id + 
+                         ", return code: " + std::to_string(ret));
+            }
+        }
+    }
+}
+
+void MarketDataServer::unsubscribe_instrument(const std::string& session_id, const std::string& instrument_id)
+{
+    if (use_multi_ctp_mode_) {
+
+        // 多CTP连接模式：使用订阅分发器
+        if (subscription_dispatcher_) {
+            subscription_dispatcher_->remove_subscription(session_id, instrument_id);
+        }
+        
+        // 同时维护instrument_subscribers_映射
+        {
+            std::lock_guard<std::mutex> lock(subscribers_mutex_);
+            auto it = instrument_subscribers_.find(instrument_id);
+            if (it != instrument_subscribers_.end()) {
+                it->second.erase(session_id);
+                if (it->second.empty()) {
+                    instrument_subscribers_.erase(it);
+                }
+            }
+        }
+    } else {
+        // 单CTP连接模式（兼容性）
+        std::lock_guard<std::mutex> lock(subscribers_mutex_);
+        
+        auto it = instrument_subscribers_.find(instrument_id);
+        if (it != instrument_subscribers_.end()) {
+            it->second.erase(session_id);
+            
+            // 如果没有会话订阅该合约了，从CTP取消订阅
+            if (it->second.empty()) {
+                instrument_subscribers_.erase(it);
+                
+                if (ctp_api_ && ctp_logged_in_) {
+                    char* instruments[] = {const_cast<char*>(instrument_id.c_str())};
+                    int ret = ctp_api_->UnSubscribeMarketData(instruments, 1);
+                    if (ret == 0) {
+                        log_info("Unsubscribed from CTP market data: " + instrument_id);
+                    } else {
+                        log_error("Failed to unsubscribe from CTP market data: " + instrument_id +
+                                 ", return code: " + std::to_string(ret));
+                    }
+                }
+            }
+        }
+    }
+}
+
+MarketDataServer::MarketDataCacheShard& MarketDataServer::get_market_data_cache_shard(const std::string& instrument_id)
+{
+    static const std::hash<std::string> hasher;
+    auto index = hasher(instrument_id) % market_data_cache_shards_.size();
+    return market_data_cache_shards_[index];
+}
+
+void MarketDataServer::cache_market_data(const std::string& instrument_id, const MarketDataStruct& data, const std::string& display_instrument)
+{
+    auto& shard = get_market_data_cache_shard(instrument_id);
+    {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto& cached = shard.cache[instrument_id];
+        cached.data = data;
+        cached.display_instrument = display_instrument;
+        cached.has_data = true;
+        ++cached.version;
+    }
+    
+    // 异步到WebSocket io_context线程，避免阻塞CTP回调线程
+    ioc_.post([this, instrument_id]() {
+        notify_pending_sessions(instrument_id);
+    });
+}
+
+void MarketDataServer::on_component_update(const std::string& component_id, const MarketDataStruct& market_data)
+{
+}
+
+void MarketDataServer::handle_peek_message(const std::string& session_id)
+{
+    // 先获取session信息和订阅信息
+    std::shared_ptr<WebSocketSession> session_ptr;
+    std::set<std::string> subscriptions;
+    
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        auto session_it = sessions_.find(session_id);
+        if (session_it == sessions_.end()) {
+            return;
+        }
+        session_ptr = session_it->second;
+        subscriptions = session_ptr->get_subscriptions();
+    }
+    
+    if (subscriptions.empty()) {
+        return;
+    }
+
+    // 读取快照和版本号，比较版本找出更新的合约
+    std::unordered_map<std::string, uint64_t> last_versions_copy;
+    std::unordered_map<std::string, MarketDataStruct> last_sent_structs_copy;
+    bool has_last_snapshot = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(session_last_sent_mutex_);
+        auto ver_it = session_last_versions_.find(session_id);
+        if (ver_it != session_last_versions_.end()) {
+            last_versions_copy = ver_it->second;
+        }
+        
+        auto struct_it = session_last_sent_structs_.find(session_id);
+        has_last_snapshot = (struct_it != session_last_sent_structs_.end() && !struct_it->second.empty());
+        if (has_last_snapshot) {
+            last_sent_structs_copy = struct_it->second;
+        }
+    }
+    
+    // 比较版本号，找出更新的合约
+    std::vector<std::pair<std::string, CachedMarketData>> updated_instruments;
+    updated_instruments.reserve(subscriptions.size());
+    
+    for (const auto& instrument_id : subscriptions) {
+        auto& shard = get_market_data_cache_shard(instrument_id);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.cache.find(instrument_id);
+        if (it != shard.cache.end() && it->second.has_data) {
+            // 检查是否需要更新：没有版本记录，或当前版本号大于上次发送的版本号
+            if (last_versions_copy.empty() || 
+                last_versions_copy.find(instrument_id) == last_versions_copy.end() ||
+                it->second.version > last_versions_copy[instrument_id]) {
+                CachedMarketData cached_copy;
+                cached_copy.data = it->second.data;
+                cached_copy.display_instrument = it->second.display_instrument;
+                cached_copy.has_data = true;
+                cached_copy.version = it->second.version;
+                updated_instruments.emplace_back(instrument_id, std::move(cached_copy));
+            }
+        }
+    }
+    
+    // 没有更新的合约，挂起
+    if (updated_instruments.empty()) {
+        if (has_last_snapshot) {
+            std::lock_guard<std::mutex> lock(pending_peek_mutex_);
+            pending_peek_sessions_.insert(session_id);
+        }
+        return;
+    }
+ 
+    // 如果没有快照，发送全量（最后才转换为JSON）
+    if (!has_last_snapshot) {
+        // 构建并发送全量消息
+        rapidjson::Document full_response;
+        full_response.SetObject();
+        auto& allocator = full_response.GetAllocator();
+        rapidjson::Value data_array(rapidjson::kArrayType);
+        rapidjson::Value data_obj(rapidjson::kObjectType);
+        rapidjson::Value quotes_obj(rapidjson::kObjectType);
+        
+        for (const auto& entry : updated_instruments) {
+            const auto& instrument_id = entry.first;
+            const auto& cached_data = entry.second;
+            
+            std::string display_instrument = cached_data.display_instrument;
+            if (display_instrument.empty()) {
+                auto map_it = noheadtohead_instruments_map_.find(instrument_id);
+                display_instrument = (map_it != noheadtohead_instruments_map_.end())
+                    ? map_it->second : instrument_id;
+            }
+            
+            rapidjson::Value inst_data = struct_to_json(cached_data.data, allocator);
+            quotes_obj.AddMember(rapidjson::Value(display_instrument.c_str(), allocator), inst_data, allocator);
+        }
+        
+        data_obj.AddMember("quotes", quotes_obj, allocator);
+        data_array.PushBack(data_obj, allocator);
+        
+        rapidjson::Value meta_obj(rapidjson::kObjectType);
+        meta_obj.AddMember("account_id", rapidjson::Value("", allocator), allocator);
+        meta_obj.AddMember("ins_list", rapidjson::Value("", allocator), allocator);
+        meta_obj.AddMember("mdhis_more_data", false, allocator);
+        data_array.PushBack(meta_obj, allocator);
+        
+        full_response.AddMember("aid", "rtn_data", allocator);
+        full_response.AddMember("data", data_array, allocator);
+        
+        // 发送全量消息
+        rapidjson::StringBuffer buffer;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+        full_response.Accept(writer);
+        session_ptr->send_message(buffer.GetString());
+
+        // 保存结构体快照和版本号
+        {
+            std::lock_guard<std::mutex> lock(session_last_sent_mutex_);
+            auto& snapshot_structs = session_last_sent_structs_[session_id];
+            auto& version_map = session_last_versions_[session_id];
+            for (const auto& entry : updated_instruments) {
+                const auto& instrument_id = entry.first;
+                const auto& cached_data = entry.second;
+                snapshot_structs[instrument_id] = cached_data.data;
+                version_map[instrument_id] = cached_data.version;
+            }
+        }
+        return;
+    }
+    
+    // 有快照，使用结构体比较计算diff（只处理更新的合约）
+    std::vector<std::pair<std::string, CachedMarketData>> diff_instruments;
+    
+    for (const auto& entry : updated_instruments) {
+        const auto& instrument_id = entry.first;
+        const auto& cached_data = entry.second;
+        
+        // 检查是否有旧的结构体快照
+        auto old_it = last_sent_structs_copy.find(instrument_id);
+        if (old_it != last_sent_structs_copy.end()) {
+            // 使用结构体比较
+            rapidjson::Document temp_doc;
+            temp_doc.SetObject();
+            auto& temp_allocator = temp_doc.GetAllocator();
+            rapidjson::Value diff_value(rapidjson::kObjectType);
+            compute_struct_diff(old_it->second, cached_data.data, diff_value, temp_allocator);
+            
+            // 如果有差异，加入diff列表
+            if (diff_value.MemberCount() > 0) {
+                diff_instruments.push_back(entry);
+            }
+        } else {
+            // 新增合约，加入diff列表
+            diff_instruments.push_back(entry);
+        }
+    }
+    
+    // 如果没有差异，挂起
+    if (diff_instruments.empty()) {
+        std::lock_guard<std::mutex> lock(pending_peek_mutex_);
+        pending_peek_sessions_.insert(session_id);
+        return;
+    }
+    
+    // 构建并发送diff响应（最后才转换为JSON）
+    rapidjson::Document diff_response;
+    diff_response.SetObject();
+    auto& diff_allocator = diff_response.GetAllocator();
+    rapidjson::Value diff_data_array(rapidjson::kArrayType);
+    rapidjson::Value diff_data_obj(rapidjson::kObjectType);
+    rapidjson::Value diff_quotes(rapidjson::kObjectType);
+    
+    for (const auto& entry : diff_instruments) {
+        const auto& instrument_id = entry.first;
+        const auto& cached_data = entry.second;
+        
+        std::string display_instrument = cached_data.display_instrument;
+        if (display_instrument.empty()) {
+            auto map_it = noheadtohead_instruments_map_.find(instrument_id);
+            display_instrument = (map_it != noheadtohead_instruments_map_.end())
+                ? map_it->second : instrument_id;
+        }
+        const char* display_key = display_instrument.c_str();
+        
+        auto old_it = last_sent_structs_copy.find(instrument_id);
+        if (old_it != last_sent_structs_copy.end()) {
+            // 使用结构体比较计算diff
+            rapidjson::Value diff_value(rapidjson::kObjectType);
+            compute_struct_diff(old_it->second, cached_data.data, diff_value, diff_allocator);
+            if (diff_value.MemberCount() > 0) {
+                rapidjson::Value key(display_key, diff_allocator);
+                diff_quotes.AddMember(key, diff_value, diff_allocator);
+            }
+        } else {
+            // 新增合约，发送全量
+            rapidjson::Value key(display_key, diff_allocator);
+            rapidjson::Value value = struct_to_json(cached_data.data, diff_allocator);
+            diff_quotes.AddMember(key, value, diff_allocator);
+        }
+    }
+    
+    diff_data_obj.AddMember("quotes", diff_quotes, diff_allocator);
+    diff_data_array.PushBack(diff_data_obj, diff_allocator);
+    
+    // meta对象
+    rapidjson::Value diff_meta_obj(rapidjson::kObjectType);
+    diff_meta_obj.AddMember("account_id", rapidjson::Value("", diff_allocator), diff_allocator);
+    diff_meta_obj.AddMember("ins_list", rapidjson::Value("", diff_allocator), diff_allocator);
+    diff_meta_obj.AddMember("mdhis_more_data", false, diff_allocator);
+    diff_data_array.PushBack(diff_meta_obj, diff_allocator);
+    
+    diff_response.AddMember("aid", "rtn_data", diff_allocator);
+    diff_response.AddMember("data", diff_data_array, diff_allocator);
+    
+    // 发送diff响应
+    rapidjson::StringBuffer diff_buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> diff_writer(diff_buffer);
+    diff_response.Accept(diff_writer);
+    session_ptr->send_message(diff_buffer.GetString());
+    
+    // 更新结构体快照和版本号
+    {
+        std::lock_guard<std::mutex> lock(session_last_sent_mutex_);
+        // 再次检查session是否存在，可能在处理过程中被删除
+        auto struct_it = session_last_sent_structs_.find(session_id);
+        if (struct_it == session_last_sent_structs_.end()) {
+            // 如果快照不存在，创建新的
+            session_last_sent_structs_[session_id] = std::unordered_map<std::string, MarketDataStruct>();
+            struct_it = session_last_sent_structs_.find(session_id);
+        }
+        
+        auto& snapshot_structs = struct_it->second;
+        auto& version_map = session_last_versions_[session_id];
+        
+        for (const auto& entry : diff_instruments) {
+            const auto& instrument_id = entry.first;
+            const auto& cached_data = entry.second;
+            snapshot_structs[instrument_id] = cached_data.data;
+            version_map[instrument_id] = cached_data.version;
+        }
+    }
+}
+
+void MarketDataServer::notify_pending_sessions(const std::string& instrument_id)
+{
+    std::set<std::string> sessions_to_notify;
+    
+    // 获取订阅了该合约且处于挂起状态的session
+    {
+        std::lock_guard<std::mutex> lock1(subscribers_mutex_);
+        std::lock_guard<std::mutex> lock2(pending_peek_mutex_);
+        
+        auto sub_it = instrument_subscribers_.find(instrument_id);
+        if (sub_it == instrument_subscribers_.end()) {
+            return;
+        }
+        
+        // 找出既订阅了该合约，又在挂起队列中的session
+        for (const auto& session_id : sub_it->second) {
+            if (pending_peek_sessions_.find(session_id) != pending_peek_sessions_.end()) {
+                sessions_to_notify.insert(session_id);
+                pending_peek_sessions_.erase(session_id);  // 从挂起队列移除
+            }
+        }
+    }
+    
+    // 唤醒这些session，触发数据推送
+    for (const auto& session_id : sessions_to_notify) {
+        log_info("Waking up pending session: " + session_id + " due to market data update: " + instrument_id);
+        handle_peek_message(session_id);  // 重新处理peek_message
+    }
+}
+
+void MarketDataServer::send_to_session(const std::string& session_id, const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    
+    auto it = sessions_.find(session_id);
+    if (it != sessions_.end()) {
+        it->second->send_message(message);
+    }
+}
+
+std::vector<std::string> MarketDataServer::get_all_instruments()
+{
+    std::vector<std::string> instruments;
+    
+    if (ins_map_) {
+        for (auto it = ins_map_->begin(); it != ins_map_->end(); ++it) {
+            std::string key(it->first.data());
+            key.erase(std::find(key.begin(), key.end(), '\0'), key.end());
+            if (!key.empty()) {
+                instruments.push_back(key);
+            }
+        }
+    }
+    
+    return instruments;
+}
+
+std::vector<std::string> MarketDataServer::search_instruments(const std::string& pattern)
+{
+    std::vector<std::string> matching_instruments;
+    
+    if (ins_map_) {
+        std::string lower_pattern = pattern;
+        std::transform(lower_pattern.begin(), lower_pattern.end(), lower_pattern.begin(), ::tolower);
+        
+        for (auto it = ins_map_->begin(); it != ins_map_->end(); ++it) {
+            std::string key(it->first.data());
+            key.erase(std::find(key.begin(), key.end(), '\0'), key.end());
+            
+            if (!key.empty()) {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+                
+                if (lower_key.find(lower_pattern) != std::string::npos) {
+                    matching_instruments.push_back(key);
+                }
+            }
+        }
+    }
+    
+    return matching_instruments;
+}
+
+void MarketDataServer::log_info(const std::string& message)
+{
+    BOOST_LOG_TRIVIAL(info) << message;
+}
+
+void MarketDataServer::log_error(const std::string& message)
+{
+    BOOST_LOG_TRIVIAL(error) << message;
+}
+
+void MarketDataServer::log_warning(const std::string& message)
+{
+    BOOST_LOG_TRIVIAL(warning) << message;
+}
+
+// 多CTP系统实现
+bool MarketDataServer::init_multi_ctp_system()
+{
+    log_info("Initializing multi-CTP system...");
+    
+    try {
+        // 创建订阅分发器
+        subscription_dispatcher_ = std::make_unique<SubscriptionDispatcher>(this);
+        
+        // 创建连接管理器
+        connection_manager_ = std::make_unique<CTPConnectionManager>(this, subscription_dispatcher_.get());
+        
+        // 初始化订阅分发器
+        if (!subscription_dispatcher_->initialize(connection_manager_.get(), multi_ctp_config_)) {
+            log_error("Failed to initialize subscription dispatcher");
+            return false;
+        }
+        
+        // 添加所有连接配置
+        for (const auto& conn_config : multi_ctp_config_.connections) {
+            if (conn_config.enabled) {
+                if (!connection_manager_->add_connection(conn_config)) {
+                    log_error("Failed to add connection: " + conn_config.connection_id);
+                    return false;
+                }
+                log_info("Added CTP connection: " + conn_config.connection_id + 
+                        " -> " + conn_config.front_addr);
+            } else {
+                log_info("Skipped disabled connection: " + conn_config.connection_id);
+            }
+        }
+        
+        // 启动所有连接
+        if (!connection_manager_->start_all_connections()) {
+            log_warning("Some CTP connections failed to start");
+        }
+        
+        log_info("Multi-CTP system initialized successfully with " + 
+                std::to_string(connection_manager_->get_total_connections()) + " connections");
+        return true;
+        
+    } catch (const std::exception& e) {
+        log_error("Exception initializing multi-CTP system: " + std::string(e.what()));
+        return false;
+    }
+}
+
+void MarketDataServer::cleanup_multi_ctp_system()
+{
+    if (connection_manager_) {
+        connection_manager_->stop_all_connections();
+        connection_manager_.reset();
+    }
+    
+    if (subscription_dispatcher_) {
+        subscription_dispatcher_->shutdown();
+        subscription_dispatcher_.reset();
+    }
+    
+    log_info("Multi-CTP system cleaned up");
+}
+
+// 多连接版本的状态查询
+bool MarketDataServer::is_ctp_connected() const
+{
+    if (use_multi_ctp_mode_) {
+        return connection_manager_ && connection_manager_->get_active_connections() > 0;
+    } else {
+        return ctp_connected_;
+    }
+}
+
+bool MarketDataServer::is_ctp_logged_in() const
+{
+    if (use_multi_ctp_mode_) {
+        return connection_manager_ && connection_manager_->get_active_connections() > 0;
+    } else {
+        return ctp_logged_in_;
+    }
+}
+
+size_t MarketDataServer::get_active_connections_count() const
+{
+    if (use_multi_ctp_mode_ && connection_manager_) {
+        return connection_manager_->get_active_connections();
+    }
+    return ctp_logged_in_ ? 1 : 0;
+}
+
+std::vector<std::string> MarketDataServer::get_connection_status() const
+{
+    std::vector<std::string> status_list;
+    
+    if (use_multi_ctp_mode_ && connection_manager_) {
+        auto connections = connection_manager_->get_all_connections();
+        for (const auto& conn : connections) {
+            std::string status = conn->get_connection_id() + ": ";
+            switch (conn->get_status()) {
+                case CTPConnectionStatus::DISCONNECTED:
+                    status += "DISCONNECTED";
+                    break;
+                case CTPConnectionStatus::CONNECTING:
+                    status += "CONNECTING";
+                    break;
+                case CTPConnectionStatus::CONNECTED:
+                    status += "CONNECTED";
+                    break;
+                case CTPConnectionStatus::LOGGED_IN:
+                    status += "LOGGED_IN (" + std::to_string(conn->get_subscription_count()) + " subs)";
+                    break;
+                case CTPConnectionStatus::ERROR:
+                    status += "ERROR";
+                    break;
+            }
+            status += " [Quality: " + std::to_string(conn->get_connection_quality()) + "%]";
+            status_list.push_back(status);
+        }
+    } else {
+        std::string status = "single_ctp: ";
+        if (ctp_logged_in_) {
+            status += "LOGGED_IN";
+        } else if (ctp_connected_) {
+            status += "CONNECTED";
+        } else {
+            status += "DISCONNECTED";
+        }
+        status_list.push_back(status);
+    }
+    
+    return status_list;
+}
