@@ -6,3 +6,4 @@ nohup.out
 venv/
 .cache/
 build/
+*.bin

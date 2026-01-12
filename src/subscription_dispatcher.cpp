@@ -6,7 +6,6 @@
 SubscriptionDispatcher::SubscriptionDispatcher(MarketDataServer* server)
     : server_(server)
     , connection_manager_(nullptr)
-    , load_balance_strategy_(LoadBalanceStrategy::CONNECTION_QUALITY)
     , round_robin_counter_(0)
     , maintenance_running_(false)
     , maintenance_interval_(60) // 60秒维护间隔
@@ -29,7 +28,6 @@ bool SubscriptionDispatcher::initialize(CTPConnectionManager* connection_manager
     connection_manager_ = connection_manager;
     
     // 从配置中读取参数
-    load_balance_strategy_ = config.load_balance_strategy;
     maintenance_interval_ = std::chrono::seconds(config.maintenance_interval);
     max_retry_count_ = config.max_retry_count;
     
@@ -37,7 +35,6 @@ bool SubscriptionDispatcher::initialize(CTPConnectionManager* connection_manager
     start_maintenance_timer();
     
     server_->log_info("SubscriptionDispatcher initialized successfully with config:");
-    server_->log_info("  - Load balance strategy: " + std::to_string(static_cast<int>(load_balance_strategy_)));
     server_->log_info("  - Maintenance interval: " + std::to_string(config.maintenance_interval) + " seconds");
     server_->log_info("  - Max retry count: " + std::to_string(max_retry_count_));
     server_->log_info("  - Auto failover: " + std::string(config.auto_failover ? "enabled" : "disabled"));
@@ -82,8 +79,8 @@ bool SubscriptionDispatcher::add_subscription(const std::string& session_id, con
     global_subscriptions_[instrument_id] = subscription_info;
     session_subscriptions_[session_id].insert(instrument_id);
     
-    // 选择最佳连接  
-    std::shared_ptr<CTPConnection> best_connection = select_connection_for_instrument(instrument_id);
+    // 使用轮询策略选择连接
+    std::shared_ptr<CTPConnection> best_connection = select_connection_round_robin();
     if (!best_connection) {
         server_->log_error("No available connection for subscription: " + instrument_id);
         subscription_info->status = SubscriptionStatus::FAILED;
@@ -211,13 +208,6 @@ size_t SubscriptionDispatcher::get_total_subscriptions() const
     return global_subscriptions_.size();
 }
 
-void SubscriptionDispatcher::set_load_balance_strategy(LoadBalanceStrategy strategy)
-{
-    load_balance_strategy_ = strategy;
-    server_->log_info("Load balance strategy changed to: " + std::to_string(static_cast<int>(strategy)));
-}
-
-
 std::shared_ptr<CTPConnection> SubscriptionDispatcher::select_connection_round_robin()
 {
     auto available_connections = connection_manager_->get_available_connections();
@@ -227,111 +217,6 @@ std::shared_ptr<CTPConnection> SubscriptionDispatcher::select_connection_round_r
     
     size_t index = round_robin_counter_++ % available_connections.size();
     return available_connections[index];
-}
-
-std::shared_ptr<CTPConnection> SubscriptionDispatcher::select_connection_least_connections()
-{
-    auto available_connections = connection_manager_->get_available_connections();
-    if (available_connections.empty()) {
-        return nullptr;
-    }
-    
-    std::shared_ptr<CTPConnection> best_connection = available_connections[0];
-    size_t min_subscriptions = best_connection->get_subscription_count();
-    
-    for (const auto& conn : available_connections) {
-        size_t sub_count = conn->get_subscription_count();
-        if (sub_count < min_subscriptions) {
-            min_subscriptions = sub_count;
-            best_connection = conn;
-        }
-    }
-    
-    return best_connection;
-}
-
-std::shared_ptr<CTPConnection> SubscriptionDispatcher::select_connection_by_quality()
-{
-    auto available_connections = connection_manager_->get_available_connections();
-    if (available_connections.empty()) {
-        return nullptr;
-    }
-    
-    std::shared_ptr<CTPConnection> best_connection = available_connections[0];
-    int best_score = calculate_connection_score(best_connection);
-    
-    for (const auto& conn : available_connections) {
-        int score = calculate_connection_score(conn);
-        if (score > best_score) {
-            best_score = score;
-            best_connection = conn;
-        }
-    }
-    
-    return best_connection;
-}
-
-std::shared_ptr<CTPConnection> SubscriptionDispatcher::select_connection_by_hash(const std::string& instrument_id)
-{
-    auto available_connections = connection_manager_->get_available_connections();
-    if (available_connections.empty()) {
-        return nullptr;
-    }
-    
-    // 使用instrument_id的哈希值来选择连接，保证相同合约总是分配到相同连接
-    std::hash<std::string> hasher;
-    size_t hash_value = hasher(instrument_id);
-    size_t index = hash_value % available_connections.size();
-    
-    return available_connections[index];
-}
-
-std::shared_ptr<CTPConnection> SubscriptionDispatcher::select_connection_for_instrument(const std::string& instrument_id)
-{
-    std::shared_ptr<CTPConnection> connection = nullptr;
-    switch (load_balance_strategy_) {
-        case LoadBalanceStrategy::ROUND_ROBIN:
-            connection = select_connection_round_robin();
-            break;
-        case LoadBalanceStrategy::LEAST_CONNECTIONS:
-            connection = select_connection_least_connections();
-            break;
-        case LoadBalanceStrategy::CONNECTION_QUALITY:
-            connection = select_connection_by_quality();
-            break;
-        case LoadBalanceStrategy::HASH_BASED:
-            connection = select_connection_by_hash(instrument_id);
-            break;
-        default:
-            connection = select_connection_by_quality();
-            break;
-    }
-    return connection;
-}
-
-int SubscriptionDispatcher::calculate_connection_score(std::shared_ptr<CTPConnection> connection)
-{
-    if (!connection) {
-        return 0;
-    }
-    
-    int score = connection->get_connection_quality();
-    
-    // 考虑订阅负载
-    size_t sub_count = connection->get_subscription_count();
-    size_t max_subs = 500; // 假设最大订阅数
-    
-    if (sub_count < max_subs * 0.5) {
-        score += 20; // 轻载加分
-    } else if (sub_count > max_subs * 0.8) {
-        score -= 30; // 重载减分
-    }
-    
-    // 考虑错误率
-    int error_count = connection->get_error_count();
-    score -= std::min(error_count * 5, 40);
-    
-    return std::max(0, score);
 }
 
 void SubscriptionDispatcher::handle_connection_failure(const std::string& connection_id)
@@ -354,7 +239,7 @@ void SubscriptionDispatcher::handle_connection_failure(const std::string& connec
     
     // 将受影响的订阅迁移到其他连接
     for (const auto& instrument_id : affected_instruments) {
-        std::shared_ptr<CTPConnection> new_connection = select_connection_for_instrument(instrument_id);
+        std::shared_ptr<CTPConnection> new_connection = select_connection_round_robin();
         if (new_connection && new_connection->get_connection_id() != connection_id) {
             migrate_subscription(instrument_id, connection_id, new_connection->get_connection_id());
         } else {
@@ -523,8 +408,8 @@ void SubscriptionDispatcher::process_pending_subscriptions()
         std::lock_guard<std::mutex> sub_lock(subscriptions_mutex_);
         auto it = global_subscriptions_.find(instrument_id);
         if (it != global_subscriptions_.end() && it->second->status == SubscriptionStatus::FAILED) {
-            // 选择新连接重试（依据配置的负载均衡策略）
-            std::shared_ptr<CTPConnection> new_connection = select_connection_for_instrument(instrument_id);
+            // 使用轮询策略选择新连接重试
+            std::shared_ptr<CTPConnection> new_connection = select_connection_round_robin();
             if (new_connection) {
                 it->second->assigned_connection_id = new_connection->get_connection_id();
                 it->second->status = SubscriptionStatus::SUBSCRIBING;

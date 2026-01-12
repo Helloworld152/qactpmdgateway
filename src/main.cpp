@@ -27,7 +27,6 @@ void print_usage() {
     std::cout << "  Multi-CTP mode (recommended):" << std::endl;
     std::cout << "    --config <config_file>    Load multi-CTP configuration from JSON file" << std::endl;
     std::cout << "    --multi-ctp               Use default multi-CTP configuration (SimNow)" << std::endl;
-    std::cout << "    --strategy <strategy>     Load balance strategy: round_robin, least_connections, connection_quality, hash_based" << std::endl;
     std::cout << std::endl;
     std::cout << "  Common options:" << std::endl;
     std::cout << "    --help                    Show this help message" << std::endl;
@@ -37,13 +36,6 @@ void print_usage() {
     std::cout << "Multi-CTP mode provides better performance and fault tolerance." << std::endl;
 }
 
-LoadBalanceStrategy parse_strategy(const std::string& strategy_str) {
-    if (strategy_str == "round_robin") return LoadBalanceStrategy::ROUND_ROBIN;
-    if (strategy_str == "least_connections") return LoadBalanceStrategy::LEAST_CONNECTIONS;
-    if (strategy_str == "connection_quality") return LoadBalanceStrategy::CONNECTION_QUALITY;
-    if (strategy_str == "hash_based") return LoadBalanceStrategy::HASH_BASED;
-    return LoadBalanceStrategy::CONNECTION_QUALITY; // 默认策略
-}
 
 int main(int argc, char* argv[]) {
     init_logging();
@@ -55,7 +47,6 @@ int main(int argc, char* argv[]) {
     // 多CTP模式参数
     bool use_multi_ctp = false;
     std::string config_file;
-    LoadBalanceStrategy strategy = LoadBalanceStrategy::CONNECTION_QUALITY;
     bool show_status = false;
 
     // 解析命令行参数
@@ -72,8 +63,6 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];
             use_multi_ctp = true;
-        } else if (arg == "--strategy" && i + 1 < argc) {
-            strategy = parse_strategy(argv[++i]);
         } else if (arg == "--front-addr" && i + 1 < argc) {
             front_addr = argv[++i];
         } else if (arg == "--broker-id" && i + 1 < argc) {
@@ -116,7 +105,6 @@ int main(int argc, char* argv[]) {
             
             // 应用命令行参数覆盖
             if (argc > 1) {
-                config.load_balance_strategy = strategy;
                 // 如果指定了端口，覆盖配置文件中的端口
                 for (int i = 1; i < argc - 1; i++) {
                     if (std::string(argv[i]) == "--port") {
@@ -134,15 +122,6 @@ int main(int argc, char* argv[]) {
             
             BOOST_LOG_TRIVIAL(info) << "Multi-CTP Mode Configuration:";
             BOOST_LOG_TRIVIAL(info) << "  WebSocket:    ws://0.0.0.0:" << config.websocket_port;
-            std::ostringstream strategy_stream;
-            strategy_stream << "  Strategy:     ";
-            switch (config.load_balance_strategy) {
-                case LoadBalanceStrategy::ROUND_ROBIN: strategy_stream << "Round Robin"; break;
-                case LoadBalanceStrategy::LEAST_CONNECTIONS: strategy_stream << "Least Connections"; break;
-                case LoadBalanceStrategy::CONNECTION_QUALITY: strategy_stream << "Connection Quality"; break;
-                case LoadBalanceStrategy::HASH_BASED: strategy_stream << "Hash Based"; break;
-            }
-            BOOST_LOG_TRIVIAL(info) << strategy_stream.str();
             BOOST_LOG_TRIVIAL(info) << "  Connections:  " << config.connections.size() << " configured";
             
             for (const auto& conn : config.connections) {

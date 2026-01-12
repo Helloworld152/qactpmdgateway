@@ -1,6 +1,7 @@
 #include "ctp_connection_manager.h"
 #include "subscription_dispatcher.h"
 #include "market_data_server.h"
+#include <boost/filesystem.hpp>
 #include <algorithm>
 #include <cstring>
 #include <thread>
@@ -18,9 +19,6 @@ CTPConnection::CTPConnection(const CTPConnectionConfig& config,
     , dispatcher_(dispatcher)
     , ctp_api_(nullptr)
     , status_(CTPConnectionStatus::DISCONNECTED)
-    , connection_quality_(0)
-    , last_heartbeat_(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()))
     , error_count_(0)
     , request_id_(0)
 {
@@ -46,9 +44,10 @@ bool CTPConnection::start()
         std::string flow_path = "./ctpflow/" + config_.connection_id + "/";
         
         // 确保flow目录存在
-        std::string mkdir_cmd = "mkdir -p " + flow_path;
-        if (system(mkdir_cmd.c_str()) != 0) {
-            server_->log_warning("Failed to create flow directory: " + flow_path);
+        try {
+            boost::filesystem::create_directories(flow_path);
+        } catch (const std::exception& e) {
+            server_->log_warning("Failed to create flow directory: " + flow_path + ", error: " + e.what());
         }
         
         ctp_api_ = CThostFtdcMdApi::CreateFtdcMdApi(flow_path.c_str());
@@ -190,8 +189,6 @@ void CTPConnection::OnFrontConnected()
 {
     server_->log_info("CTP connection " + config_.connection_id + " front connected");
     status_ = CTPConnectionStatus::CONNECTED;
-    last_heartbeat_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch());
     login();
 }
 
@@ -199,7 +196,6 @@ void CTPConnection::OnFrontDisconnected(int nReason)
 {
     server_->log_warning("CTP connection " + config_.connection_id + " front disconnected, reason: " + std::to_string(nReason));
     status_ = CTPConnectionStatus::DISCONNECTED;
-    connection_quality_ = 0;
     error_count_++;
     
     // 通知订阅分发器连接断开
@@ -221,7 +217,6 @@ void CTPConnection::OnRspUserLogin(CThostFtdcRspUserLoginField *pRspUserLogin,
     
     server_->log_info("CTP login successful on connection " + config_.connection_id);
     status_ = CTPConnectionStatus::LOGGED_IN;
-    connection_quality_ = 80; // 初始连接质量
     
     // 通知订阅分发器连接恢复
     if (dispatcher_) {
@@ -282,11 +277,6 @@ void CTPConnection::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthM
         return;
     }
     
-    // 更新连接质量和心跳
-    last_heartbeat_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch());
-    update_connection_quality();
-    
     std::string instrument_id = pDepthMarketData->InstrumentID;
     
     // 通过映射表查找带前缀的格式
@@ -344,42 +334,11 @@ void CTPConnection::login()
     }
 }
 
-void CTPConnection::update_connection_quality()
-{
-    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch());
-    auto time_since_heartbeat = now - last_heartbeat_;
-    
-    int quality = 100;
-    
-    // 根据心跳间隔调整质量
-    if (time_since_heartbeat.count() > 10000) { // 10秒
-        quality -= 30;
-    } else if (time_since_heartbeat.count() > 5000) { // 5秒
-        quality -= 15;
-    }
-    
-    // 根据错误数量调整质量
-    int error_penalty = std::min(error_count_.load() * 10, 50);
-    quality -= error_penalty;
-    
-    // 根据订阅负载调整质量
-    size_t subscription_count = get_subscription_count();
-    if (subscription_count > config_.max_subscriptions * 0.8) {
-        quality -= 20;
-    } else if (subscription_count > config_.max_subscriptions * 0.6) {
-        quality -= 10;
-    }
-    
-    connection_quality_ = std::max(0, std::min(100, quality));
-}
-
 void CTPConnection::handle_connection_error()
 {
     if (error_count_ > 10) {
         server_->log_error("Too many errors on connection " + config_.connection_id + ", marking as failed");
         status_ = CTPConnectionStatus::ERROR;
-        connection_quality_ = 0;
     }
 }
 
@@ -498,29 +457,6 @@ std::vector<std::shared_ptr<CTPConnection>> CTPConnectionManager::get_available_
     return result;
 }
 
-std::shared_ptr<CTPConnection> CTPConnectionManager::get_best_connection_for_subscription()
-{
-    auto available_connections = get_available_connections();
-    
-    if (available_connections.empty()) {
-        return nullptr;
-    }
-    
-    // 选择质量最高的连接
-    std::shared_ptr<CTPConnection> best_connection = available_connections[0];
-    int best_quality = best_connection->get_connection_quality();
-    
-    for (const auto& conn : available_connections) {
-        int quality = conn->get_connection_quality();
-        if (quality > best_quality) {
-            best_quality = quality;
-            best_connection = conn;
-        }
-    }
-    
-    return best_connection;
-}
-
 size_t CTPConnectionManager::get_total_connections() const
 {
     std::lock_guard<std::mutex> lock(connections_mutex_);
@@ -626,14 +562,5 @@ void CTPConnectionManager::health_check_loop()
         for (int i = 0; i < health_check_interval_.count() && health_check_running_; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-    }
-}
-
-void CTPConnectionManager::handle_connection_failure(const std::string& connection_id)
-{
-    server_->log_warning("Handling connection failure: " + connection_id);
-    
-    if (dispatcher_) {
-        dispatcher_->handle_connection_failure(connection_id);
     }
 }

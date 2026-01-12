@@ -47,10 +47,6 @@ public:
     const std::string& get_connection_id() const { return config_.connection_id; }
     size_t get_subscription_count() const;
     bool can_accept_more_subscriptions() const;
-    
-    // 连接质量指标
-    int get_connection_quality() const { return connection_quality_; }
-    std::chrono::milliseconds get_last_heartbeat() const { return last_heartbeat_; }
     int get_error_count() const { return error_count_; }
     
     // CTP SPI回调实现
@@ -70,7 +66,6 @@ public:
     
 private:
     void login();
-    void update_connection_quality();
     void handle_connection_error();
     
     CTPConnectionConfig config_;
@@ -81,9 +76,6 @@ private:
     std::atomic<CTPConnectionStatus> status_;
     std::set<std::string> subscribed_instruments_;
     
-    // 连接质量监控
-    std::atomic<int> connection_quality_;  // 0-100的连接质量评分
-    std::chrono::milliseconds last_heartbeat_;
     std::atomic<int> error_count_;
     std::atomic<int> request_id_;
     
@@ -110,7 +102,6 @@ public:
     std::shared_ptr<CTPConnection> get_connection(const std::string& connection_id);
     std::vector<std::shared_ptr<CTPConnection>> get_all_connections();
     std::vector<std::shared_ptr<CTPConnection>> get_available_connections();
-    std::shared_ptr<CTPConnection> get_best_connection_for_subscription();
     
     // 连接状态监控
     size_t get_total_connections() const;
@@ -123,7 +114,6 @@ public:
     
 private:
     void health_check_loop();
-    void handle_connection_failure(const std::string& connection_id);
     
     MarketDataServer* server_;
     SubscriptionDispatcher* dispatcher_;

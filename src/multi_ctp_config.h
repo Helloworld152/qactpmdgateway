@@ -14,14 +14,6 @@ struct CTPConnectionConfig {
     bool enabled = true;          // 是否启用此连接
 };
 
-// 负载均衡策略
-enum class LoadBalanceStrategy {
-    ROUND_ROBIN = 0,    // 轮询
-    LEAST_CONNECTIONS,  // 最少连接数
-    CONNECTION_QUALITY, // 连接质量优先
-    HASH_BASED         // 基于合约ID的哈希
-};
-
 // 多CTP连接配置
 struct MultiCTPConfig {
     // 全局配置
@@ -29,9 +21,6 @@ struct MultiCTPConfig {
     
     // 连接配置列表
     std::vector<CTPConnectionConfig> connections;
-    
-    // 负载均衡策略
-    LoadBalanceStrategy load_balance_strategy = LoadBalanceStrategy::CONNECTION_QUALITY;
     
     // 高级配置
     int health_check_interval = 30;     // 健康检查间隔(秒)
@@ -83,7 +72,6 @@ inline MultiCTPConfig create_simnow_config() {
     conn3.enabled = true;
     
     config.connections = {conn1, conn2, conn3};
-    config.load_balance_strategy = LoadBalanceStrategy::CONNECTION_QUALITY;
     config.auto_failover = true;
     
     return config;

@@ -68,9 +68,6 @@ public:
     SubscriptionStatus get_subscription_status(const std::string& instrument_id);
     size_t get_total_subscriptions() const;
     
-    // 负载均衡策略
-    void set_load_balance_strategy(LoadBalanceStrategy strategy);
-    LoadBalanceStrategy get_load_balance_strategy() const { return load_balance_strategy_; }
     
     // 故障转移
     void handle_connection_failure(const std::string& connection_id);
@@ -92,29 +89,18 @@ public:
     void stop_maintenance_timer();
     
 private:
-    // 负载均衡算法实现
+    // 负载均衡算法实现（轮询）
     std::shared_ptr<CTPConnection> select_connection_round_robin();
-    std::shared_ptr<CTPConnection> select_connection_least_connections();
-    std::shared_ptr<CTPConnection> select_connection_by_quality();
-    std::shared_ptr<CTPConnection> select_connection_by_hash(const std::string& instrument_id);
-    // 基于配置的选连封装
-    std::shared_ptr<CTPConnection> select_connection_for_instrument(const std::string& instrument_id);
     
     // 订阅处理
     bool execute_subscription(const std::string& instrument_id, const std::string& connection_id);
     bool execute_unsubscription(const std::string& instrument_id, const std::string& connection_id);
     void process_pending_subscriptions();
-    void retry_failed_subscriptions();
     
     // 故障转移处理
-    void migrate_subscriptions(const std::string& failed_connection_id, 
-                             const std::string& target_connection_id);
     void migrate_subscription(const std::string& instrument_id, 
                             const std::string& from_connection_id, 
                             const std::string& to_connection_id);
-    
-    // 连接评分
-    int calculate_connection_score(std::shared_ptr<CTPConnection> connection);
     
     // 维护任务
     void maintenance_task();
@@ -128,8 +114,7 @@ private:
     std::map<std::string, std::set<std::string>> session_subscriptions_;             // session_id -> instrument_ids
     std::map<std::string, std::set<std::string>> connection_subscriptions_;          // connection_id -> instrument_ids
     
-    // 负载均衡
-    LoadBalanceStrategy load_balance_strategy_;
+    // 负载均衡（仅轮询）
     std::atomic<size_t> round_robin_counter_;
     
     // 线程安全

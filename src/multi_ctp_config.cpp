@@ -34,19 +34,6 @@ bool ConfigLoader::load_from_json(const std::string& json_content, MultiCTPConfi
             config.websocket_port = doc["websocket_port"].GetInt();
         }
         
-        // 解析负载均衡策略
-        if (doc.HasMember("load_balance_strategy") && doc["load_balance_strategy"].IsString()) {
-            std::string strategy = doc["load_balance_strategy"].GetString();
-            if (strategy == "round_robin") {
-                config.load_balance_strategy = LoadBalanceStrategy::ROUND_ROBIN;
-            } else if (strategy == "least_connections") {
-                config.load_balance_strategy = LoadBalanceStrategy::LEAST_CONNECTIONS;
-            } else if (strategy == "connection_quality") {
-                config.load_balance_strategy = LoadBalanceStrategy::CONNECTION_QUALITY;
-            } else if (strategy == "hash_based") {
-                config.load_balance_strategy = LoadBalanceStrategy::HASH_BASED;
-            }
-        }
         
         // 解析高级配置
         if (doc.HasMember("health_check_interval") && doc["health_check_interval"].IsInt()) {
@@ -115,7 +102,6 @@ MultiCTPConfig ConfigLoader::create_default_config()
 {
     MultiCTPConfig config;
     config.websocket_port = 7799;
-    config.load_balance_strategy = LoadBalanceStrategy::CONNECTION_QUALITY;
     config.health_check_interval = 30;
     config.maintenance_interval = 60;
     config.max_retry_count = 3;

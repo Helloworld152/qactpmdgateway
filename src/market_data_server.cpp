@@ -1,15 +1,38 @@
 #include "market_data_server.h"
 #include <boost/log/trivial.hpp>
+#include <boost/filesystem.hpp>
 #include <sstream>
 #include <cstring>
 #include <chrono>
 #include <random>
 #include <algorithm>
 #include <cmath>
-#include <chrono>
+
+// 预分配的JSON key字符串（避免运行时字符串拼接）
+namespace {
+    const char* const ASK_PRICE_KEYS[] = {
+        "ask_price1", "ask_price2", "ask_price3", "ask_price4", "ask_price5",
+        "ask_price6", "ask_price7", "ask_price8", "ask_price9", "ask_price10"
+    };
+    const char* const ASK_VOLUME_KEYS[] = {
+        "ask_volume1", "ask_volume2", "ask_volume3", "ask_volume4", "ask_volume5",
+        "ask_volume6", "ask_volume7", "ask_volume8", "ask_volume9", "ask_volume10"
+    };
+    const char* const BID_PRICE_KEYS[] = {
+        "bid_price1", "bid_price2", "bid_price3", "bid_price4", "bid_price5",
+        "bid_price6", "bid_price7", "bid_price8", "bid_price9", "bid_price10"
+    };
+    const char* const BID_VOLUME_KEYS[] = {
+        "bid_volume1", "bid_volume2", "bid_volume3", "bid_volume4", "bid_volume5",
+        "bid_volume6", "bid_volume7", "bid_volume8", "bid_volume9", "bid_volume10"
+    };
+}
 
 namespace beast = boost::beast;
 namespace http = beast::http;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
+using tcp = net::ip::tcp;
 
 // WebSocketSession实现
 WebSocketSession::WebSocketSession(tcp::socket&& socket, MarketDataServer* server)
@@ -305,20 +328,34 @@ MarketDataStruct MarketDataServer::build_market_data_struct(CThostFtdcDepthMarke
     strncpy(data.instrument_id, display_instrument.c_str(), sizeof(data.instrument_id) - 1);
     data.instrument_id[sizeof(data.instrument_id) - 1] = '\0';
     
-    // 构建datetime字符串
-    std::ostringstream oss;
-    std::string trading_day = pDepthMarketData->TradingDay;
-    if (trading_day.size() >= 8) {
-        oss << trading_day.substr(0, 4) << "-"
-            << trading_day.substr(4, 2) << "-"
-            << trading_day.substr(6, 2);
-    } else {
-        oss << trading_day;
+    // 手动高效构建 datetime 字符串 (YYYY-MM-DD HH:MM:SS.mmm)
+    char* dt = data.datetime;
+    const char* td = pDepthMarketData->TradingDay;
+    const char* ut = pDepthMarketData->UpdateTime;
+    int ms = pDepthMarketData->UpdateMillisec;
+
+    // YYYY-MM-DD
+    if (td[0] >= '0' && td[0] <= '9') {
+        dt[0] = td[0]; dt[1] = td[1]; dt[2] = td[2]; dt[3] = td[3];
+        dt[4] = '-';
+        dt[5] = td[4]; dt[6] = td[5];
+        dt[7] = '-';
+        dt[8] = td[6]; dt[9] = td[7];
+        dt[10] = ' ';
+        dt += 11;
     }
-    oss << " " << pDepthMarketData->UpdateTime << "." << pDepthMarketData->UpdateMillisec;
-    std::string datetime_str = oss.str();
-    strncpy(data.datetime, datetime_str.c_str(), sizeof(data.datetime) - 1);
-    data.datetime[sizeof(data.datetime) - 1] = '\0';
+
+    // HH:MM:SS.mmm
+    if (ut[0] != '\0') {
+        memcpy(dt, ut, 8);
+        dt[8] = '.';
+        dt[9] = '0' + (ms / 100 % 10);
+        dt[10] = '0' + (ms / 10 % 10);
+        dt[11] = '0' + (ms % 10);
+        dt[12] = '\0';
+    } else {
+        *dt = '\0';
+    }
     
     data.timestamp = cur_time;
     
@@ -473,23 +510,16 @@ rapidjson::Value MarketDataServer::struct_to_json(const MarketDataStruct& data,
     inst_data.AddMember("ask_price6", rapidjson::Value().SetNull(), allocator);
     inst_data.AddMember("ask_volume6", rapidjson::Value().SetNull(), allocator);
     
+    // Ask 5-1 (使用预分配的key，使用StringRef避免拷贝)
     for (int i = 4; i >= 0; --i) {
-        std::string price_key = "ask_price" + std::to_string(i + 1);
-        std::string volume_key = "ask_volume" + std::to_string(i + 1);
-        rapidjson::Value price_key_value(price_key.c_str(), allocator);
-        rapidjson::Value volume_key_value(volume_key.c_str(), allocator);
-        inst_data.AddMember(price_key_value, data.ask_price[i], allocator);
-        inst_data.AddMember(volume_key_value, data.ask_volume[i], allocator);
+        inst_data.AddMember(rapidjson::StringRef(ASK_PRICE_KEYS[i]), data.ask_price[i], allocator);
+        inst_data.AddMember(rapidjson::StringRef(ASK_VOLUME_KEYS[i]), data.ask_volume[i], allocator);
     }
     
-    // Bid 1-5
+    // Bid 1-5 (使用预分配的key，使用StringRef避免拷贝)
     for (int i = 0; i < 5; ++i) {
-        std::string price_key = "bid_price" + std::to_string(i + 1);
-        std::string volume_key = "bid_volume" + std::to_string(i + 1);
-        rapidjson::Value price_key_value(price_key.c_str(), allocator);
-        rapidjson::Value volume_key_value(volume_key.c_str(), allocator);
-        inst_data.AddMember(price_key_value, data.bid_price[i], allocator);
-        inst_data.AddMember(volume_key_value, data.bid_volume[i], allocator);
+        inst_data.AddMember(rapidjson::StringRef(BID_PRICE_KEYS[i]), data.bid_price[i], allocator);
+        inst_data.AddMember(rapidjson::StringRef(BID_VOLUME_KEYS[i]), data.bid_volume[i], allocator);
     }
     
     // Bid 6-10为null
@@ -529,60 +559,99 @@ rapidjson::Value MarketDataServer::struct_to_json(const MarketDataStruct& data,
 }
 
 // 结构体字段级比较，返回差异字段的JSON
+bool MarketDataServer::has_struct_changes(const MarketDataStruct& old_data, const MarketDataStruct& new_data)
+{
+    // 快速比较：先比较基本字段
+    if (strcmp(old_data.instrument_id, new_data.instrument_id) != 0 ||
+        strcmp(old_data.datetime, new_data.datetime) != 0 ||
+        old_data.timestamp != new_data.timestamp) {
+        return true;
+    }
+    
+    // 比较数组字段
+    if (memcmp(old_data.ask_price, new_data.ask_price, sizeof(old_data.ask_price)) != 0 ||
+        memcmp(old_data.ask_volume, new_data.ask_volume, sizeof(old_data.ask_volume)) != 0 ||
+        memcmp(old_data.bid_price, new_data.bid_price, sizeof(old_data.bid_price)) != 0 ||
+        memcmp(old_data.bid_volume, new_data.bid_volume, sizeof(old_data.bid_volume)) != 0) {
+        return true;
+    }
+    
+    // 比较其他价格字段
+    if (old_data.last_price != new_data.last_price ||
+        old_data.highest != new_data.highest ||
+        old_data.lowest != new_data.lowest ||
+        old_data.open != new_data.open ||
+        old_data.close != new_data.close ||
+        old_data.settlement != new_data.settlement ||
+        old_data.upper_limit != new_data.upper_limit ||
+        old_data.lower_limit != new_data.lower_limit ||
+        old_data.pre_settlement != new_data.pre_settlement ||
+        old_data.pre_close != new_data.pre_close) {
+        return true;
+    }
+    
+    // 比较整数字段
+    if (old_data.volume != new_data.volume ||
+        old_data.amount != new_data.amount ||
+        old_data.open_interest != new_data.open_interest ||
+        old_data.pre_open_interest != new_data.pre_open_interest) {
+        return true;
+    }
+    
+    return false;
+}
+
 void MarketDataServer::compute_struct_diff(const MarketDataStruct& old_data,
                                           const MarketDataStruct& new_data,
-                                          rapidjson::Value& diff_val,
-                                          rapidjson::Document::AllocatorType& allocator)
+                                          rapidjson::Writer<rapidjson::StringBuffer>& writer)
 {
-    diff_val.SetObject();
+    writer.StartObject();
     
     // 比较基本字段
     if (strcmp(old_data.instrument_id, new_data.instrument_id) != 0) {
-        diff_val.AddMember("instrument_id", rapidjson::Value(new_data.instrument_id, allocator), allocator);
+        writer.Key("instrument_id");
+        writer.String(new_data.instrument_id);
     }
     
     if (strcmp(old_data.datetime, new_data.datetime) != 0) {
-        diff_val.AddMember("datetime", rapidjson::Value(new_data.datetime, allocator), allocator);
+        writer.Key("datetime");
+        writer.String(new_data.datetime);
     }
     
     if (old_data.timestamp != new_data.timestamp) {
-        diff_val.AddMember("timestamp", new_data.timestamp, allocator);
+        writer.Key("timestamp");
+        writer.Uint64(new_data.timestamp);
     }
     
     // 比较Ask价格和量
     for (int i = 0; i < 10; ++i) {
-        std::string price_key = "ask_price" + std::to_string(i + 1);
-        std::string volume_key = "ask_volume" + std::to_string(i + 1);
         if (old_data.ask_price[i] != new_data.ask_price[i]) {
-            rapidjson::Value price_key_value(price_key.c_str(), allocator);
-            diff_val.AddMember(price_key_value, new_data.ask_price[i], allocator);
+            writer.Key(ASK_PRICE_KEYS[i]);
+            writer.Double(new_data.ask_price[i]);
         }
         if (old_data.ask_volume[i] != new_data.ask_volume[i]) {
-            rapidjson::Value volume_key_value(volume_key.c_str(), allocator);
-            diff_val.AddMember(volume_key_value, new_data.ask_volume[i], allocator);
+            writer.Key(ASK_VOLUME_KEYS[i]);
+            writer.Int(new_data.ask_volume[i]);
         }
     }
     
     // 比较Bid价格和量
     for (int i = 0; i < 10; ++i) {
-        std::string price_key = "bid_price" + std::to_string(i + 1);
-        std::string volume_key = "bid_volume" + std::to_string(i + 1);
         if (old_data.bid_price[i] != new_data.bid_price[i]) {
-            rapidjson::Value price_key_value(price_key.c_str(), allocator);
-            diff_val.AddMember(price_key_value, new_data.bid_price[i], allocator);
+            writer.Key(BID_PRICE_KEYS[i]);
+            writer.Double(new_data.bid_price[i]);
         }
         if (old_data.bid_volume[i] != new_data.bid_volume[i]) {
-            rapidjson::Value volume_key_value(volume_key.c_str(), allocator);
-            diff_val.AddMember(volume_key_value, new_data.bid_volume[i], allocator);
+            writer.Key(BID_VOLUME_KEYS[i]);
+            writer.Int(new_data.bid_volume[i]);
         }
     }
     
     // 比较其他价格字段
     auto add_price_diff = [&](const char* key, double old_val, double new_val) {
         if (old_val != new_val) {
-            rapidjson::Value key_value(key, allocator);
-            rapidjson::Value value(new_val);
-            diff_val.AddMember(key_value, value, allocator);
+            writer.Key(key);
+            writer.Double(new_val);
         }
     };
     
@@ -599,20 +668,26 @@ void MarketDataServer::compute_struct_diff(const MarketDataStruct& old_data,
     
     // 比较整数字段
     if (old_data.volume != new_data.volume) {
-        diff_val.AddMember("volume", new_data.volume, allocator);
+        writer.Key("volume");
+        writer.Int(new_data.volume);
     }
     
     if (old_data.amount != new_data.amount) {
-        diff_val.AddMember("amount", new_data.amount, allocator);
+        writer.Key("amount");
+        writer.Double(new_data.amount);
     }
     
     if (old_data.open_interest != new_data.open_interest) {
-        diff_val.AddMember("open_interest", new_data.open_interest, allocator);
+        writer.Key("open_interest");
+        writer.Int64(new_data.open_interest);
     }
     
     if (old_data.pre_open_interest != new_data.pre_open_interest) {
-        diff_val.AddMember("pre_open_interest", new_data.pre_open_interest, allocator);
+        writer.Key("pre_open_interest");
+        writer.Int64(new_data.pre_open_interest);
     }
+    
+    writer.EndObject();
 }
 
 void MarketDataSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthMarketData)
@@ -621,11 +696,6 @@ void MarketDataSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthM
 
     auto cur_time = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
-    // Debug打印行情数据接收信息
-    server_->log_info("DEBUG: Received market data for instrument: " + std::string(pDepthMarketData->InstrumentID) + 
-                     ", price: " + std::to_string(pDepthMarketData->LastPrice) + 
-                     ", volume: " + std::to_string(pDepthMarketData->Volume));
-    
     std::string instrument_id = pDepthMarketData->InstrumentID;
     
     // 通过映射表查找带前缀的格式
@@ -669,6 +739,9 @@ MarketDataServer::MarketDataServer(const std::string& ctp_front_addr,
     , is_running_(false)
     , request_id_(0)
 {
+    // 预分配缓存，避免运行时的内存重分配
+    market_data_cache_.resize(50000);
+    display_instruments_cache_.resize(50000);
 }
 
 MarketDataServer::MarketDataServer(const MultiCTPConfig& config)
@@ -687,6 +760,9 @@ MarketDataServer::MarketDataServer(const MultiCTPConfig& config)
     , is_running_(false)
     , request_id_(0)
 {
+    // 预分配缓存，避免运行时的内存重分配
+    market_data_cache_.resize(50000);
+    display_instruments_cache_.resize(50000);
 }
 
 MarketDataServer::~MarketDataServer()
@@ -721,9 +797,10 @@ bool MarketDataServer::start()
             std::string flow_path = "./ctpflow/single/";
             
             // 确保flow目录存在
-            std::string mkdir_cmd = "mkdir -p " + flow_path;
-            if (system(mkdir_cmd.c_str()) != 0) {
-                log_warning("Failed to create flow directory: " + flow_path);
+            try {
+                boost::filesystem::create_directories(flow_path);
+            } catch (const std::exception& e) {
+                log_warning("Failed to create flow directory: " + flow_path + ", error: " + e.what());
             }
             
             ctp_api_ = CThostFtdcMdApi::CreateFtdcMdApi(flow_path.c_str());
@@ -1090,24 +1167,77 @@ void MarketDataServer::unsubscribe_instrument(const std::string& session_id, con
     }
 }
 
-MarketDataServer::MarketDataCacheShard& MarketDataServer::get_market_data_cache_shard(const std::string& instrument_id)
+int MarketDataServer::get_or_create_index(const std::string& instrument_id, const std::string& display_instrument)
 {
-    static const std::hash<std::string> hasher;
-    auto index = hasher(instrument_id) % market_data_cache_shards_.size();
-    return market_data_cache_shards_[index];
+    // 快速路径：使用读锁查找
+    {
+        std::shared_lock<std::shared_mutex> lock(index_map_mutex_);
+        auto it = instrument_index_map_.find(instrument_id);
+        if (it != instrument_index_map_.end()) {
+            return it->second;
+        }
+    }
+    
+    // 慢速路径：使用写锁插入
+    std::unique_lock<std::shared_mutex> lock(index_map_mutex_);
+    
+    // 再次检查以防其他线程已经插入
+    auto it = instrument_index_map_.find(instrument_id);
+    if (it != instrument_index_map_.end()) {
+        return it->second;
+    }
+    
+    int index = static_cast<int>(instrument_index_map_.size());
+    
+    // Check capacity
+    if (index >= static_cast<int>(market_data_cache_.size())) {
+        log_error("Market data cache capacity exceeded (" + std::to_string(market_data_cache_.size()) + ")");
+        return -1;
+    }
+    
+    instrument_index_map_[instrument_id] = index;
+    if (!display_instrument.empty()) {
+        display_instruments_cache_[index] = display_instrument;
+    } else {
+        // 回退或查找已有映射
+        auto map_it = noheadtohead_instruments_map_.find(instrument_id);
+        display_instruments_cache_[index] = (map_it != noheadtohead_instruments_map_.end()) 
+            ? map_it->second : instrument_id;
+    }
+    
+    return index;
+}
+
+int MarketDataServer::get_index(const std::string& instrument_id) const
+{
+    std::shared_lock<std::shared_mutex> lock(index_map_mutex_);
+    auto it = instrument_index_map_.find(instrument_id);
+    if (it != instrument_index_map_.end()) {
+        return it->second;
+    }
+    return -1;
 }
 
 void MarketDataServer::cache_market_data(const std::string& instrument_id, const MarketDataStruct& data, const std::string& display_instrument)
 {
-    auto& shard = get_market_data_cache_shard(instrument_id);
-    {
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto& cached = shard.cache[instrument_id];
-        cached.data = data;
-        cached.display_instrument = display_instrument;
-        cached.has_data = true;
-        ++cached.version;
-    }
+    int index = get_or_create_index(instrument_id, display_instrument);
+    if (index < 0) return;
+    
+    // SeqLock 写入过程:
+    // 1. 加载当前序列号
+    // 2. 序列号 + 1 (变奇数) -> 内存屏障 release
+    // 3. 写入数据
+    // 4. 序列号 + 1 (变偶数) -> 内存屏障 release
+    
+    AtomicMarketDataEntry& entry = market_data_cache_[index];
+    
+    uint64_t seq = entry.sequence.load(std::memory_order_relaxed);
+    entry.sequence.store(seq + 1, std::memory_order_release);
+    
+    entry.data = data;
+    entry.has_data = true;
+    
+    entry.sequence.store(seq + 2, std::memory_order_release);
     
     // 异步到WebSocket io_context线程，避免阻塞CTP回调线程
     ioc_.post([this, instrument_id]() {
@@ -1121,9 +1251,12 @@ void MarketDataServer::on_component_update(const std::string& component_id, cons
 
 void MarketDataServer::handle_peek_message(const std::string& session_id)
 {
-    // 先获取session信息和订阅信息
+    using clock = std::chrono::steady_clock;
+    const auto start_time = clock::now();
+    
+    // 1. 获取 Session 和订阅信息
     std::shared_ptr<WebSocketSession> session_ptr;
-    std::set<std::string> subscriptions;
+    const std::set<std::string>* subscriptions_ptr = nullptr;
     
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -1132,232 +1265,297 @@ void MarketDataServer::handle_peek_message(const std::string& session_id)
             return;
         }
         session_ptr = session_it->second;
-        subscriptions = session_ptr->get_subscriptions();
+        // 使用引用避免拷贝，但需要确保在锁保护下使用
+        subscriptions_ptr = &session_it->second->get_subscriptions();
     }
     
-    if (subscriptions.empty()) {
+    // 快速检查是否为空（避免后续处理）
+    if (!subscriptions_ptr || subscriptions_ptr->empty()) {
         return;
     }
+    
+    // 创建局部拷贝用于后续处理（此时已释放锁）
+    std::set<std::string> subscriptions = *subscriptions_ptr;
 
-    // 读取快照和版本号，比较版本找出更新的合约
-    std::unordered_map<std::string, uint64_t> last_versions_copy;
-    std::unordered_map<std::string, MarketDataStruct> last_sent_structs_copy;
+    // 2. 获取该 Session 上次的状态（版本号和快照）
+    // 使用指针引用避免不必要的拷贝，只在需要时拷贝
+    const std::unordered_map<std::string, uint64_t>* last_versions_ptr = nullptr;
+    const std::unordered_map<std::string, MarketDataStruct>* last_sent_structs_ptr = nullptr;
     bool has_last_snapshot = false;
     
     {
         std::lock_guard<std::mutex> lock(session_last_sent_mutex_);
         auto ver_it = session_last_versions_.find(session_id);
-        if (ver_it != session_last_versions_.end()) {
-            last_versions_copy = ver_it->second;
+        if (ver_it != session_last_versions_.end() && !ver_it->second.empty()) {
+            last_versions_ptr = &ver_it->second;
         }
         
         auto struct_it = session_last_sent_structs_.find(session_id);
         has_last_snapshot = (struct_it != session_last_sent_structs_.end() && !struct_it->second.empty());
         if (has_last_snapshot) {
-            last_sent_structs_copy = struct_it->second;
+            last_sent_structs_ptr = &struct_it->second;
         }
     }
     
-    // 比较版本号，找出更新的合约
-    std::vector<std::pair<std::string, CachedMarketData>> updated_instruments;
-    updated_instruments.reserve(subscriptions.size());
-    
-    for (const auto& instrument_id : subscriptions) {
-        auto& shard = get_market_data_cache_shard(instrument_id);
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.cache.find(instrument_id);
-        if (it != shard.cache.end() && it->second.has_data) {
-            // 检查是否需要更新：没有版本记录，或当前版本号大于上次发送的版本号
-            if (last_versions_copy.empty() || 
-                last_versions_copy.find(instrument_id) == last_versions_copy.end() ||
-                it->second.version > last_versions_copy[instrument_id]) {
-                CachedMarketData cached_copy;
-                cached_copy.data = it->second.data;
-                cached_copy.display_instrument = it->second.display_instrument;
-                cached_copy.has_data = true;
-                cached_copy.version = it->second.version;
-                updated_instruments.emplace_back(instrument_id, std::move(cached_copy));
-            }
-        }
+    // 创建局部拷贝用于后续处理（此时已释放锁）
+    std::unordered_map<std::string, uint64_t> last_versions_copy;
+    std::unordered_map<std::string, MarketDataStruct> last_sent_structs_copy;
+    if (last_versions_ptr) {
+        last_versions_copy = *last_versions_ptr;
     }
+    if (last_sent_structs_ptr) {
+        last_sent_structs_copy = *last_sent_structs_ptr;
+    }
+
+    // 3. 收集有更新的合约数据
+    auto updated_instruments = collect_market_data_updates(subscriptions, last_versions_copy);
     
-    // 没有更新的合约，挂起
+    // 4. 如果没有更新，加入挂起队列
     if (updated_instruments.empty()) {
-        if (has_last_snapshot) {
+        if (has_last_snapshot) { // 只有在已经推送过数据的情况下才挂起，否则应该推送空全量(虽然这很少见)
             std::lock_guard<std::mutex> lock(pending_peek_mutex_);
             pending_peek_sessions_.insert(session_id);
         }
         return;
     }
  
-    // 如果没有快照，发送全量（最后才转换为JSON）
+    // 5. 发送数据（全量或增量）
     if (!has_last_snapshot) {
-        // 构建并发送全量消息
-        rapidjson::Document full_response;
-        full_response.SetObject();
-        auto& allocator = full_response.GetAllocator();
-        rapidjson::Value data_array(rapidjson::kArrayType);
-        rapidjson::Value data_obj(rapidjson::kObjectType);
-        rapidjson::Value quotes_obj(rapidjson::kObjectType);
-        
-        for (const auto& entry : updated_instruments) {
-            const auto& instrument_id = entry.first;
-            const auto& cached_data = entry.second;
-            
-            std::string display_instrument = cached_data.display_instrument;
-            if (display_instrument.empty()) {
-                auto map_it = noheadtohead_instruments_map_.find(instrument_id);
-                display_instrument = (map_it != noheadtohead_instruments_map_.end())
-                    ? map_it->second : instrument_id;
-            }
-            
-            rapidjson::Value inst_data = struct_to_json(cached_data.data, allocator);
-            quotes_obj.AddMember(rapidjson::Value(display_instrument.c_str(), allocator), inst_data, allocator);
-        }
-        
-        data_obj.AddMember("quotes", quotes_obj, allocator);
-        data_array.PushBack(data_obj, allocator);
-        
-        rapidjson::Value meta_obj(rapidjson::kObjectType);
-        meta_obj.AddMember("account_id", rapidjson::Value("", allocator), allocator);
-        meta_obj.AddMember("ins_list", rapidjson::Value("", allocator), allocator);
-        meta_obj.AddMember("mdhis_more_data", false, allocator);
-        data_array.PushBack(meta_obj, allocator);
-        
-        full_response.AddMember("aid", "rtn_data", allocator);
-        full_response.AddMember("data", data_array, allocator);
-        
-        // 发送全量消息
-        rapidjson::StringBuffer buffer;
-        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-        full_response.Accept(writer);
-        session_ptr->send_message(buffer.GetString());
-
-        // 保存结构体快照和版本号
-        {
-            std::lock_guard<std::mutex> lock(session_last_sent_mutex_);
-            auto& snapshot_structs = session_last_sent_structs_[session_id];
-            auto& version_map = session_last_versions_[session_id];
-            for (const auto& entry : updated_instruments) {
-                const auto& instrument_id = entry.first;
-                const auto& cached_data = entry.second;
-                snapshot_structs[instrument_id] = cached_data.data;
-                version_map[instrument_id] = cached_data.version;
-            }
-        }
-        return;
+        send_full_snapshot(session_ptr, updated_instruments);
+    } else {
+        size_t diff_count = send_diff_snapshot(session_ptr, updated_instruments, last_sent_structs_copy);
+        const auto end_time = clock::now();
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        BOOST_LOG_TRIVIAL(info) << "peek_message processing time: " << elapsed_ms << " ms, diff instrument count: " << diff_count;
     }
+
+    // 6. 更新 Session 状态
+    update_session_state(session_id, updated_instruments);
+}
+
+std::vector<std::pair<std::string, MarketDataServer::SnapshotData>> MarketDataServer::collect_market_data_updates(
+    const std::set<std::string>& subscriptions, 
+    const std::unordered_map<std::string, uint64_t>& last_versions)
+{
+    std::vector<std::pair<std::string, SnapshotData>> updated_instruments;
+    updated_instruments.reserve(subscriptions.size());
     
-    // 有快照，使用结构体比较计算diff（只处理更新的合约）
-    std::vector<std::pair<std::string, CachedMarketData>> diff_instruments;
+    for (const auto& instrument_id : subscriptions) {
+        int index = get_index(instrument_id);
+        if (index == -1) continue;
+
+        AtomicMarketDataEntry& entry = market_data_cache_[index];
+        if (!entry.has_data) continue;
+
+        MarketDataStruct data_snapshot;
+        uint64_t seq_start = 0, seq_end = 0;
+        int retries = 0;
+
+        // SeqLock 读取循环
+        do {
+            seq_start = entry.sequence.load(std::memory_order_acquire);
+            if (seq_start % 2 != 0) {
+                std::this_thread::yield();
+                if (++retries > 100) break;
+                continue;
+            }
+            
+            data_snapshot = entry.data;
+            
+            seq_end = entry.sequence.load(std::memory_order_acquire);
+            if (++retries > 100) break;
+            
+        } while (seq_start != seq_end);
+
+        if (seq_start != seq_end || seq_start % 2 != 0) {
+            continue;
+        }
+
+        uint64_t current_version = seq_end / 2;
+
+        // 检查版本号
+        if (last_versions.empty() || 
+            last_versions.find(instrument_id) == last_versions.end() ||
+            current_version > last_versions.at(instrument_id)) {
+            
+            SnapshotData snapshot;
+            snapshot.data = data_snapshot;
+            {
+                std::shared_lock<std::shared_mutex> lock(index_map_mutex_);
+                if (index < static_cast<int>(display_instruments_cache_.size())) {
+                    snapshot.display_instrument = &display_instruments_cache_[index];
+                }
+            }
+            snapshot.has_data = true;
+            snapshot.version = current_version;
+            updated_instruments.emplace_back(instrument_id, std::move(snapshot));
+        }
+    }
+    return updated_instruments;
+}
+
+void MarketDataServer::send_full_snapshot(
+    std::shared_ptr<WebSocketSession> session, 
+    const std::vector<std::pair<std::string, SnapshotData>>& updates)
+{
+    rapidjson::Document full_response;
+    full_response.SetObject();
+    auto& allocator = full_response.GetAllocator();
     
-    for (const auto& entry : updated_instruments) {
+    rapidjson::Value data_array(rapidjson::kArrayType);
+    rapidjson::Value data_obj(rapidjson::kObjectType);
+    rapidjson::Value quotes_obj(rapidjson::kObjectType);
+    
+    for (const auto& entry : updates) {
         const auto& instrument_id = entry.first;
         const auto& cached_data = entry.second;
         
-        // 检查是否有旧的结构体快照
-        auto old_it = last_sent_structs_copy.find(instrument_id);
-        if (old_it != last_sent_structs_copy.end()) {
-            // 使用结构体比较
-            rapidjson::Document temp_doc;
-            temp_doc.SetObject();
-            auto& temp_allocator = temp_doc.GetAllocator();
-            rapidjson::Value diff_value(rapidjson::kObjectType);
-            compute_struct_diff(old_it->second, cached_data.data, diff_value, temp_allocator);
-            
-            // 如果有差异，加入diff列表
-            if (diff_value.MemberCount() > 0) {
+        // display_instrument 已在 collect_market_data_updates 中设置，无需重复查找
+        const std::string& display_instrument = (cached_data.display_instrument == nullptr || cached_data.display_instrument->empty()) 
+            ? instrument_id : *cached_data.display_instrument;
+        
+        rapidjson::Value inst_data = struct_to_json(cached_data.data, allocator);
+        quotes_obj.AddMember(rapidjson::Value(display_instrument.c_str(), allocator), inst_data, allocator);
+    }
+    
+    data_obj.AddMember("quotes", quotes_obj, allocator);
+    data_array.PushBack(data_obj, allocator);
+    
+    rapidjson::Value meta_obj(rapidjson::kObjectType);
+    meta_obj.AddMember("account_id", rapidjson::Value("", allocator), allocator);
+    meta_obj.AddMember("ins_list", rapidjson::Value("", allocator), allocator);
+    meta_obj.AddMember("mdhis_more_data", false, allocator);
+    data_array.PushBack(meta_obj, allocator);
+    
+    full_response.AddMember("aid", "rtn_data", allocator);
+    full_response.AddMember("data", data_array, allocator);
+    
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    full_response.Accept(writer);
+    session->send_message(buffer.GetString());
+}
+
+size_t MarketDataServer::send_diff_snapshot(
+    std::shared_ptr<WebSocketSession> session, 
+    const std::vector<std::pair<std::string, SnapshotData>>& updates,
+    const std::unordered_map<std::string, MarketDataStruct>& last_snapshots)
+{
+    // 计算 Diff
+    std::vector<std::pair<std::string, SnapshotData>> diff_instruments;
+    
+    for (const auto& entry : updates) {
+        const auto& instrument_id = entry.first;
+        const auto& cached_data = entry.second;
+        
+        auto old_it = last_snapshots.find(instrument_id);
+        if (old_it != last_snapshots.end()) {
+            // 预先检查是否有差异，避免不必要的 JSON 构建
+            if (has_struct_changes(old_it->second, cached_data.data)) {
                 diff_instruments.push_back(entry);
             }
         } else {
-            // 新增合约，加入diff列表
+            // 新增合约
             diff_instruments.push_back(entry);
         }
     }
     
-    // 如果没有差异，挂起
-    if (diff_instruments.empty()) {
-        std::lock_guard<std::mutex> lock(pending_peek_mutex_);
-        pending_peek_sessions_.insert(session_id);
-        return;
-    }
+    if (diff_instruments.empty()) return 0;
+
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
     
-    // 构建并发送diff响应（最后才转换为JSON）
-    rapidjson::Document diff_response;
-    diff_response.SetObject();
-    auto& diff_allocator = diff_response.GetAllocator();
-    rapidjson::Value diff_data_array(rapidjson::kArrayType);
-    rapidjson::Value diff_data_obj(rapidjson::kObjectType);
-    rapidjson::Value diff_quotes(rapidjson::kObjectType);
+    // 开始构建JSON: { "aid": "rtn_data", "data": [ ... ] }
+    writer.StartObject();
     
+    writer.Key("aid");
+    writer.String("rtn_data");
+    
+    writer.Key("data");
+    writer.StartArray();
+    
+    // Data Object 1: Quotes
+    writer.StartObject();
+    writer.Key("quotes");
+    writer.StartObject();
+    
+    bool has_content = false;
+
+    // 预备分配器用于全量数据构建(struct_to_json仍需要allocator，暂时保留DOM模式混合使用或者重构)
+    // 为了最大化性能，全量数据应该也SAX化，但此处为了最小改动先只处理Diff逻辑
+    rapidjson::Document temp_doc; 
+    auto& allocator = temp_doc.GetAllocator();
+
     for (const auto& entry : diff_instruments) {
         const auto& instrument_id = entry.first;
         const auto& cached_data = entry.second;
         
-        std::string display_instrument = cached_data.display_instrument;
-        if (display_instrument.empty()) {
-            auto map_it = noheadtohead_instruments_map_.find(instrument_id);
-            display_instrument = (map_it != noheadtohead_instruments_map_.end())
-                ? map_it->second : instrument_id;
-        }
-        const char* display_key = display_instrument.c_str();
+        // display_instrument 已在 collect_market_data_updates 中设置，无需重复查找
+        const std::string& display_instrument = (cached_data.display_instrument == nullptr || cached_data.display_instrument->empty()) 
+            ? instrument_id : *cached_data.display_instrument;
         
-        auto old_it = last_sent_structs_copy.find(instrument_id);
-        if (old_it != last_sent_structs_copy.end()) {
-            // 使用结构体比较计算diff
-            rapidjson::Value diff_value(rapidjson::kObjectType);
-            compute_struct_diff(old_it->second, cached_data.data, diff_value, diff_allocator);
-            if (diff_value.MemberCount() > 0) {
-                rapidjson::Value key(display_key, diff_allocator);
-                diff_quotes.AddMember(key, diff_value, diff_allocator);
-            }
+        auto old_it = last_snapshots.find(instrument_id);
+        if (old_it != last_snapshots.end()) {
+            // 计算 Diff 并直接写入 Writer
+            writer.Key(display_instrument.c_str());
+            compute_struct_diff(old_it->second, cached_data.data, writer);
+            has_content = true;
         } else {
-            // 新增合约，发送全量
-            rapidjson::Value key(display_key, diff_allocator);
-            rapidjson::Value value = struct_to_json(cached_data.data, diff_allocator);
-            diff_quotes.AddMember(key, value, diff_allocator);
+            // 全量 - 这里暂时混合使用 struct_to_json (DOM) 然后 Accept 到 Writer
+            // 理想情况是 struct_to_json 也重构为 Writer 模式
+            writer.Key(display_instrument.c_str());
+            rapidjson::Value full_val = struct_to_json(cached_data.data, allocator);
+            full_val.Accept(writer);
+            has_content = true;
         }
     }
     
-    diff_data_obj.AddMember("quotes", diff_quotes, diff_allocator);
-    diff_data_array.PushBack(diff_data_obj, diff_allocator);
+    writer.EndObject(); // End quotes
+    writer.EndObject(); // End Data Object 1
+
+    // Data Object 2: Meta
+    writer.StartObject();
+    writer.Key("account_id"); writer.String("");
+    writer.Key("ins_list"); writer.String("");
+    writer.Key("mdhis_more_data"); writer.Bool(false);
+    writer.EndObject();
     
-    // meta对象
-    rapidjson::Value diff_meta_obj(rapidjson::kObjectType);
-    diff_meta_obj.AddMember("account_id", rapidjson::Value("", diff_allocator), diff_allocator);
-    diff_meta_obj.AddMember("ins_list", rapidjson::Value("", diff_allocator), diff_allocator);
-    diff_meta_obj.AddMember("mdhis_more_data", false, diff_allocator);
-    diff_data_array.PushBack(diff_meta_obj, diff_allocator);
+    writer.EndArray(); // End data array
+    writer.EndObject(); // End root object
     
-    diff_response.AddMember("aid", "rtn_data", diff_allocator);
-    diff_response.AddMember("data", diff_data_array, diff_allocator);
+    // 如果没有实际内容（理论上 diff_instruments 不空就不会发生，除非 compute_struct_diff 全空），
+    // 但前面已有 has_struct_changes 检查，所以这里应该总是有内容。
+    if (has_content) {
+        session->send_message(buffer.GetString());
+    } else {
+        std::lock_guard<std::mutex> lock(pending_peek_mutex_);
+        pending_peek_sessions_.insert(session->get_session_id());
+    }
     
-    // 发送diff响应
-    rapidjson::StringBuffer diff_buffer;
-    rapidjson::Writer<rapidjson::StringBuffer> diff_writer(diff_buffer);
-    diff_response.Accept(diff_writer);
-    session_ptr->send_message(diff_buffer.GetString());
+    return diff_instruments.size();
+}
+
+void MarketDataServer::update_session_state(
+    const std::string& session_id, 
+    const std::vector<std::pair<std::string, SnapshotData>>& updates)
+{
+    std::lock_guard<std::mutex> lock(session_last_sent_mutex_);
     
-    // 更新结构体快照和版本号
-    {
-        std::lock_guard<std::mutex> lock(session_last_sent_mutex_);
-        // 再次检查session是否存在，可能在处理过程中被删除
-        auto struct_it = session_last_sent_structs_.find(session_id);
-        if (struct_it == session_last_sent_structs_.end()) {
-            // 如果快照不存在，创建新的
-            session_last_sent_structs_[session_id] = std::unordered_map<std::string, MarketDataStruct>();
-            struct_it = session_last_sent_structs_.find(session_id);
-        }
-        
-        auto& snapshot_structs = struct_it->second;
-        auto& version_map = session_last_versions_[session_id];
-        
-        for (const auto& entry : diff_instruments) {
-            const auto& instrument_id = entry.first;
-            const auto& cached_data = entry.second;
-            snapshot_structs[instrument_id] = cached_data.data;
-            version_map[instrument_id] = cached_data.version;
-        }
+    // 再次检查 session 是否存在，可能在处理过程中被删除
+    auto struct_it = session_last_sent_structs_.find(session_id);
+    if (struct_it == session_last_sent_structs_.end()) {
+        session_last_sent_structs_[session_id] = std::unordered_map<std::string, MarketDataStruct>();
+        struct_it = session_last_sent_structs_.find(session_id);
+    }
+    
+    auto& snapshot_structs = struct_it->second;
+    auto& version_map = session_last_versions_[session_id];
+    
+    for (const auto& entry : updates) {
+        const auto& instrument_id = entry.first;
+        const auto& cached_data = entry.second;
+        snapshot_structs[instrument_id] = cached_data.data;
+        version_map[instrument_id] = cached_data.version;
     }
 }
 
@@ -1573,7 +1771,6 @@ std::vector<std::string> MarketDataServer::get_connection_status() const
                     status += "ERROR";
                     break;
             }
-            status += " [Quality: " + std::to_string(conn->get_connection_quality()) + "%]";
             status_list.push_back(status);
         }
     } else {

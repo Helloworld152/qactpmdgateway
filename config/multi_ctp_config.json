@@ -1,6 +1,5 @@
 {
   "websocket_port": 7899,
-  "load_balance_strategy": "connection_quality",
   "health_check_interval": 30,
   "maintenance_interval": 60,
   "max_retry_count": 10,

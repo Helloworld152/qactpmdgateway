@@ -1,5 +1,6 @@
 #pragma once
 
+#include <shared_mutex>
 #include "../libs/ThostFtdcMdApi.h"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -22,11 +23,7 @@
 #include "subscription_dispatcher.h"
 #include "multi_ctp_config.h"
 
-namespace beast = boost::beast;
-namespace http = beast::http;
-namespace websocket = beast::websocket;
-namespace net = boost::asio;
-using tcp = net::ip::tcp;
+using TcpSocket = boost::asio::ip::tcp::socket;
 
 struct MarketDataStruct {
     char instrument_id[32];
@@ -60,13 +57,45 @@ struct MarketDataStruct {
     // Close/Settlement: checks against 1e300.
 };
 
+// 内存对齐的原子行情缓存条目（SeqLock模式）
+struct alignas(64) AtomicMarketDataEntry {
+    std::atomic<uint64_t> sequence{0}; // 序列号（偶数=有效，奇数=更新中）
+    MarketDataStruct data;
+    bool has_data = false;
+    
+    AtomicMarketDataEntry() = default;
+
+    // 拷贝构造函数（非线程安全，但在锁保护下的resize中是安全的）
+    AtomicMarketDataEntry(const AtomicMarketDataEntry& other) {
+        sequence.store(other.sequence.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        data = other.data;
+        has_data = other.has_data;
+    }
+
+    // 移动构造函数
+    AtomicMarketDataEntry(AtomicMarketDataEntry&& other) noexcept {
+        sequence.store(other.sequence.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        data = other.data;
+        has_data = other.has_data;
+    }
+
+    AtomicMarketDataEntry& operator=(const AtomicMarketDataEntry& other) {
+        if (this != &other) {
+            sequence.store(other.sequence.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            data = other.data;
+            has_data = other.has_data;
+        }
+        return *this;
+    }
+};
+
 class MarketDataServer;
 
 // WebSocket连接会话
 class WebSocketSession : public std::enable_shared_from_this<WebSocketSession>
 {
 public:
-    explicit WebSocketSession(tcp::socket&& socket, MarketDataServer* server);
+    explicit WebSocketSession(boost::asio::ip::tcp::socket&& socket, MarketDataServer* server);
     ~WebSocketSession();
     
     void run();
@@ -77,18 +106,18 @@ public:
     const std::set<std::string>& get_subscriptions() const { return subscriptions_; }
     
 private:
-    void on_accept(beast::error_code ec);
+    void on_accept(boost::beast::error_code ec);
     void do_read();
-    void on_read(beast::error_code ec, std::size_t bytes_transferred);
+    void on_read(boost::beast::error_code ec, std::size_t bytes_transferred);
     void start_write();
-    void on_write(beast::error_code ec, std::size_t bytes_transferred);
+    void on_write(boost::beast::error_code ec, std::size_t bytes_transferred);
     
     void handle_message(const std::string& message);
     void send_error(const std::string& error_msg);
     void send_response(const std::string& type, const rapidjson::Document& data);
     
-    websocket::stream<beast::tcp_stream> ws_;
-    beast::flat_buffer buffer_;
+    boost::beast::websocket::stream<boost::beast::tcp_stream> ws_;
+    boost::beast::flat_buffer buffer_;
     std::queue<std::string> message_queue_;
     std::string current_write_message_;
     std::string session_id_;
@@ -161,11 +190,13 @@ public:
     static rapidjson::Value struct_to_json(const MarketDataStruct& data,
                                           rapidjson::Document::AllocatorType& allocator);
     
-    // 结构体字段级比较，返回差异字段的JSON
+    // 快速检查结构体是否有差异（避免无差异时构建JSON）
+    static bool has_struct_changes(const MarketDataStruct& old_data, const MarketDataStruct& new_data);
+    
+    // 结构体字段级比较，直接写入Writer（SAX模式优化）
     static void compute_struct_diff(const MarketDataStruct& old_data,
                                    const MarketDataStruct& new_data,
-                                   rapidjson::Value& diff_val,
-                                   rapidjson::Document::AllocatorType& allocator);
+                                   rapidjson::Writer<rapidjson::StringBuffer>& writer);
 
     // 合约管理
     std::vector<std::string> get_all_instruments();
@@ -185,7 +216,7 @@ public:
     rapidjson::Document get_server_status_json();
     void notify_pending_sessions(const std::string& instrument_id);
     
-    net::io_context& io_context() { return ioc_; }
+    boost::asio::io_context& io_context() { return ioc_; }
 
     // 日志函数
     void log_info(const std::string& message);
@@ -193,22 +224,42 @@ public:
     void log_warning(const std::string& message);
     
 private:
-    struct CachedMarketData {
+    // 快照数据辅助结构
+    struct SnapshotData {
         MarketDataStruct data;
-        std::string display_instrument;
+        const std::string* display_instrument = nullptr;
         uint64_t version = 0;
         bool has_data = false;
     };
-    
-    struct alignas(64) MarketDataCacheShard {
-        std::mutex mutex;
-        std::unordered_map<std::string, CachedMarketData> cache;
-    };
+
+    // handle_peek_message 的辅助函数
+    std::vector<std::pair<std::string, SnapshotData>> collect_market_data_updates(
+        const std::set<std::string>& subscriptions, 
+        const std::unordered_map<std::string, uint64_t>& last_versions);
+        
+    void send_full_snapshot(
+        std::shared_ptr<WebSocketSession> session, 
+        const std::vector<std::pair<std::string, SnapshotData>>& updates);
+        
+    size_t send_diff_snapshot(
+        std::shared_ptr<WebSocketSession> session, 
+        const std::vector<std::pair<std::string, SnapshotData>>& updates,
+        const std::unordered_map<std::string, MarketDataStruct>& last_snapshots);
+        
+    void update_session_state(
+        const std::string& session_id, 
+        const std::vector<std::pair<std::string, SnapshotData>>& updates);
+
     void init_shared_memory();
     void cleanup_shared_memory();
     void start_websocket_server();
-    void handle_accept(beast::error_code ec, tcp::socket socket);
-    MarketDataCacheShard& get_market_data_cache_shard(const std::string& instrument_id);
+    void handle_accept(boost::beast::error_code ec, boost::asio::ip::tcp::socket socket);
+    
+    // 助手函数：获取或创建合约索引
+    int get_or_create_index(const std::string& instrument_id, const std::string& display_instrument = "");
+    // 助手函数：获取现有合约索引（无锁或读锁）
+    int get_index(const std::string& instrument_id) const;
+
 public:
     void ctp_login();
     std::string create_session_id();
@@ -232,12 +283,21 @@ private:
     bool use_multi_ctp_mode_;
     
     // WebSocket服务器
-    net::io_context ioc_;
+    boost::asio::io_context ioc_;
     int websocket_port_;
-    tcp::acceptor acceptor_;
+    boost::asio::ip::tcp::acceptor acceptor_;
     std::map<std::string, std::shared_ptr<WebSocketSession>> sessions_;
     std::map<std::string, std::set<std::string>> instrument_subscribers_; // instrument_id -> session_ids
-    std::array<MarketDataCacheShard, 1024> market_data_cache_shards_;
+    
+    // --- 优化后的缓存存储 (SeqLock + 扁平数组) ---
+    // 预分配的行情缓存
+    std::vector<AtomicMarketDataEntry> market_data_cache_;
+    // 并行的显示名称数组（写一次，读多次）
+    std::vector<std::string> display_instruments_cache_;
+    
+    // InstrumentID 到 索引 的映射
+    std::unordered_map<std::string, int> instrument_index_map_;
+    mutable std::shared_mutex index_map_mutex_; // 保护映射表和索引分配
     
     // 客户端上次发送的行情数据快照（使用结构体存储）: session_id -> instrument_id -> MarketDataStruct
     std::map<std::string, std::unordered_map<std::string, MarketDataStruct>> session_last_sent_structs_;
