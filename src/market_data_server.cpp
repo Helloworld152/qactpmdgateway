@@ -558,6 +558,101 @@ rapidjson::Value MarketDataServer::struct_to_json(const MarketDataStruct& data,
     return inst_data;
 }
 
+// 优化：直接写入Writer，避免DOM构建（SAX模式）
+template<typename Writer>
+void MarketDataServer::struct_to_writer(const MarketDataStruct& data, Writer& writer)
+{
+    writer.StartObject();
+    
+    writer.Key("instrument_id");
+    writer.String(data.instrument_id);
+    writer.Key("datetime");
+    writer.String(data.datetime);
+    writer.Key("timestamp");
+    writer.Uint64(data.timestamp);
+    
+    // Ask 10-1 (10-6为null)
+    writer.Key("ask_price10"); writer.Null();
+    writer.Key("ask_volume10"); writer.Null();
+    writer.Key("ask_price9"); writer.Null();
+    writer.Key("ask_volume9"); writer.Null();
+    writer.Key("ask_price8"); writer.Null();
+    writer.Key("ask_volume8"); writer.Null();
+    writer.Key("ask_price7"); writer.Null();
+    writer.Key("ask_volume7"); writer.Null();
+    writer.Key("ask_price6"); writer.Null();
+    writer.Key("ask_volume6"); writer.Null();
+    
+    // Ask 5-1 (使用预分配的key)
+    for (int i = 4; i >= 0; --i) {
+        writer.Key(ASK_PRICE_KEYS[i]);
+        writer.Double(data.ask_price[i]);
+        writer.Key(ASK_VOLUME_KEYS[i]);
+        writer.Int(data.ask_volume[i]);
+    }
+    
+    // Bid 1-5 (使用预分配的key)
+    for (int i = 0; i < 5; ++i) {
+        writer.Key(BID_PRICE_KEYS[i]);
+        writer.Double(data.bid_price[i]);
+        writer.Key(BID_VOLUME_KEYS[i]);
+        writer.Int(data.bid_volume[i]);
+    }
+    
+    // Bid 6-10为null
+    writer.Key("bid_price6"); writer.Null();
+    writer.Key("bid_volume6"); writer.Null();
+    writer.Key("bid_price7"); writer.Null();
+    writer.Key("bid_volume7"); writer.Null();
+    writer.Key("bid_price8"); writer.Null();
+    writer.Key("bid_volume8"); writer.Null();
+    writer.Key("bid_price9"); writer.Null();
+    writer.Key("bid_volume9"); writer.Null();
+    writer.Key("bid_price10"); writer.Null();
+    writer.Key("bid_volume10"); writer.Null();
+    
+    // 其他字段
+    writer.Key("last_price");
+    writer.Double(data.last_price);
+    writer.Key("highest");
+    writer.Double(data.highest);
+    writer.Key("lowest");
+    writer.Double(data.lowest);
+    writer.Key("open");
+    writer.Double(data.open);
+    writer.Key("close");
+    writer.Double(data.close);
+    
+    writer.Key("average"); writer.Null();
+    writer.Key("volume");
+    writer.Int(data.volume);
+    writer.Key("amount");
+    writer.Double(data.amount);
+    writer.Key("open_interest");
+    writer.Int64(data.open_interest);
+    
+    writer.Key("settlement");
+    writer.Double(data.settlement);
+    writer.Key("upper_limit");
+    writer.Double(data.upper_limit);
+    writer.Key("lower_limit");
+    writer.Double(data.lower_limit);
+    
+    writer.Key("pre_open_interest");
+    writer.Int64(data.pre_open_interest);
+    
+    writer.Key("pre_settlement");
+    writer.Double(data.pre_settlement);
+    writer.Key("pre_close");
+    writer.Double(data.pre_close);
+    
+    writer.EndObject();
+}
+
+// 显式实例化模板
+template void MarketDataServer::struct_to_writer<rapidjson::Writer<rapidjson::StringBuffer>>(
+    const MarketDataStruct&, rapidjson::Writer<rapidjson::StringBuffer>&);
+
 // 结构体字段级比较，返回差异字段的JSON
 bool MarketDataServer::has_struct_changes(const MarketDataStruct& old_data, const MarketDataStruct& new_data)
 {
@@ -1297,15 +1392,17 @@ void MarketDataServer::handle_peek_message(const std::string& session_id)
         }
     }
     
-    // 创建局部拷贝用于后续处理（此时已释放锁）
+    // 优化：避免拷贝大map，使用引用或指针
+    // 对于版本号map，需要拷贝用于collect_market_data_updates（因为需要修改）
     std::unordered_map<std::string, uint64_t> last_versions_copy;
-    std::unordered_map<std::string, MarketDataStruct> last_sent_structs_copy;
     if (last_versions_ptr) {
         last_versions_copy = *last_versions_ptr;
     }
-    if (last_sent_structs_ptr) {
-        last_sent_structs_copy = *last_sent_structs_ptr;
-    }
+    
+    // 对于last_sent_structs，使用引用避免拷贝（在锁保护下获取引用，后续只读）
+    // 如果last_sent_structs_ptr为空，创建空map作为fallback
+    static const std::unordered_map<std::string, MarketDataStruct> empty_map;
+    const auto& last_snapshots = last_sent_structs_ptr ? *last_sent_structs_ptr : empty_map;
 
     // 3. 收集有更新的合约数据
     auto updated_instruments = collect_market_data_updates(subscriptions, last_versions_copy);
@@ -1323,7 +1420,7 @@ void MarketDataServer::handle_peek_message(const std::string& session_id)
     if (!has_last_snapshot) {
         send_full_snapshot(session_ptr, updated_instruments);
     } else {
-        size_t diff_count = send_diff_snapshot(session_ptr, updated_instruments, last_sent_structs_copy);
+        size_t diff_count = send_diff_snapshot(session_ptr, updated_instruments, last_snapshots);
         const auto end_time = clock::now();
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
         BOOST_LOG_TRIVIAL(info) << "peek_message processing time: " << elapsed_ms << " ms, diff instrument count: " << diff_count;
@@ -1373,66 +1470,83 @@ std::vector<std::pair<std::string, MarketDataServer::SnapshotData>> MarketDataSe
 
         uint64_t current_version = seq_end / 2;
 
-        // 检查版本号
+        // 检查版本号（优化：合并 find + at 为一次查找）
+        auto ver_it = last_versions.find(instrument_id);
         if (last_versions.empty() || 
-            last_versions.find(instrument_id) == last_versions.end() ||
-            current_version > last_versions.at(instrument_id)) {
+            ver_it == last_versions.end() ||
+            current_version > ver_it->second) {
             
             SnapshotData snapshot;
             snapshot.data = data_snapshot;
-            {
-                std::shared_lock<std::shared_mutex> lock(index_map_mutex_);
-                if (index < static_cast<int>(display_instruments_cache_.size())) {
-                    snapshot.display_instrument = &display_instruments_cache_[index];
-                }
-            }
             snapshot.has_data = true;
             snapshot.version = current_version;
+            snapshot.index = index;  // 保存index，用于批量获取display_instrument
             updated_instruments.emplace_back(instrument_id, std::move(snapshot));
         }
     }
+    
+    // 优化：批量获取display_instrument，减少锁竞争
+    if (!updated_instruments.empty()) {
+        std::shared_lock<std::shared_mutex> lock(index_map_mutex_);
+        for (auto& entry : updated_instruments) {
+            auto& snapshot = entry.second;
+            if (snapshot.index >= 0 && snapshot.index < static_cast<int>(display_instruments_cache_.size())) {
+                snapshot.display_instrument = &display_instruments_cache_[snapshot.index];
+            }
+        }
+    }
+    
     return updated_instruments;
 }
 
 void MarketDataServer::send_full_snapshot(
-    std::shared_ptr<WebSocketSession> session, 
+    std::shared_ptr<WebSocketSession> session,
     const std::vector<std::pair<std::string, SnapshotData>>& updates)
 {
-    rapidjson::Document full_response;
-    full_response.SetObject();
-    auto& allocator = full_response.GetAllocator();
+    // 优化：使用Writer模式，避免DOM构建
+    rapidjson::StringBuffer buffer;
+    buffer.Reserve(updates.size() * 300);  // 预分配
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
     
-    rapidjson::Value data_array(rapidjson::kArrayType);
-    rapidjson::Value data_obj(rapidjson::kObjectType);
-    rapidjson::Value quotes_obj(rapidjson::kObjectType);
+    // 开始构建JSON: { "aid": "rtn_data", "data": [ ... ] }
+    writer.StartObject();
+    
+    writer.Key("aid");
+    writer.String("rtn_data");
+    
+    writer.Key("data");
+    writer.StartArray();
+    
+    // Data Object 1: Quotes
+    writer.StartObject();
+    writer.Key("quotes");
+    writer.StartObject();
     
     for (const auto& entry : updates) {
         const auto& instrument_id = entry.first;
         const auto& cached_data = entry.second;
-        
+
         // display_instrument 已在 collect_market_data_updates 中设置，无需重复查找
-        const std::string& display_instrument = (cached_data.display_instrument == nullptr || cached_data.display_instrument->empty()) 
+        const std::string& display_instrument = (cached_data.display_instrument == nullptr || cached_data.display_instrument->empty())
             ? instrument_id : *cached_data.display_instrument;
-        
-        rapidjson::Value inst_data = struct_to_json(cached_data.data, allocator);
-        quotes_obj.AddMember(rapidjson::Value(display_instrument.c_str(), allocator), inst_data, allocator);
+
+        writer.Key(display_instrument.c_str());
+        struct_to_writer(cached_data.data, writer);  // 直接写入Writer
     }
-    
-    data_obj.AddMember("quotes", quotes_obj, allocator);
-    data_array.PushBack(data_obj, allocator);
-    
-    rapidjson::Value meta_obj(rapidjson::kObjectType);
-    meta_obj.AddMember("account_id", rapidjson::Value("", allocator), allocator);
-    meta_obj.AddMember("ins_list", rapidjson::Value("", allocator), allocator);
-    meta_obj.AddMember("mdhis_more_data", false, allocator);
-    data_array.PushBack(meta_obj, allocator);
-    
-    full_response.AddMember("aid", "rtn_data", allocator);
-    full_response.AddMember("data", data_array, allocator);
-    
-    rapidjson::StringBuffer buffer;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-    full_response.Accept(writer);
+
+    writer.EndObject(); // End quotes
+    writer.EndObject(); // End Data Object 1
+
+    // Data Object 2: Meta
+    writer.StartObject();
+    writer.Key("account_id"); writer.String("");
+    writer.Key("ins_list"); writer.String("");
+    writer.Key("mdhis_more_data"); writer.Bool(false);
+    writer.EndObject();
+
+    writer.EndArray(); // End data array
+    writer.EndObject(); // End root object
+
     session->send_message(buffer.GetString());
 }
 
@@ -1441,28 +1555,39 @@ size_t MarketDataServer::send_diff_snapshot(
     const std::vector<std::pair<std::string, SnapshotData>>& updates,
     const std::unordered_map<std::string, MarketDataStruct>& last_snapshots)
 {
-    // 计算 Diff
-    std::vector<std::pair<std::string, SnapshotData>> diff_instruments;
+    // 优化：合并两次遍历，缓存查找结果，避免重复查找
+    // 存储需要发送的diff数据及其对应的旧数据指针
+    struct DiffEntry {
+        const std::string* instrument_id;
+        const SnapshotData* snapshot_data;
+        const MarketDataStruct* old_data;  // nullptr表示新增合约
+    };
     
+    std::vector<DiffEntry> diff_entries;
+    diff_entries.reserve(updates.size());
+    
+    // 第一次遍历：筛选需要发送的合约，并缓存查找结果
+    // 注意：updates中的合约已经通过版本号筛选（current_version > last_version），
+    // 所以版本号不同 = 数据已更新，无需再调用 has_struct_changes 检查
     for (const auto& entry : updates) {
         const auto& instrument_id = entry.first;
         const auto& cached_data = entry.second;
         
         auto old_it = last_snapshots.find(instrument_id);
         if (old_it != last_snapshots.end()) {
-            // 预先检查是否有差异，避免不必要的 JSON 构建
-            if (has_struct_changes(old_it->second, cached_data.data)) {
-                diff_instruments.push_back(entry);
-            }
+            // 版本号已不同，直接加入（无需 has_struct_changes 检查）
+            diff_entries.push_back({&instrument_id, &cached_data, &old_it->second});
         } else {
             // 新增合约
-            diff_instruments.push_back(entry);
+            diff_entries.push_back({&instrument_id, &cached_data, nullptr});
         }
     }
     
-    if (diff_instruments.empty()) return 0;
+    if (diff_entries.empty()) return 0;
 
+    // 预分配StringBuffer，估算大小：每个合约约200-500字节
     rapidjson::StringBuffer buffer;
+    buffer.Reserve(diff_entries.size() * 300);
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
     
     // 开始构建JSON: { "aid": "rtn_data", "data": [ ... ] }
@@ -1481,31 +1606,24 @@ size_t MarketDataServer::send_diff_snapshot(
     
     bool has_content = false;
 
-    // 预备分配器用于全量数据构建(struct_to_json仍需要allocator，暂时保留DOM模式混合使用或者重构)
-    // 为了最大化性能，全量数据应该也SAX化，但此处为了最小改动先只处理Diff逻辑
-    rapidjson::Document temp_doc; 
-    auto& allocator = temp_doc.GetAllocator();
-
-    for (const auto& entry : diff_instruments) {
-        const auto& instrument_id = entry.first;
-        const auto& cached_data = entry.second;
+    // 第二次遍历：直接使用缓存的查找结果构建JSON
+    for (const auto& diff_entry : diff_entries) {
+        const auto& instrument_id = *diff_entry.instrument_id;
+        const auto& cached_data = *diff_entry.snapshot_data;
         
         // display_instrument 已在 collect_market_data_updates 中设置，无需重复查找
         const std::string& display_instrument = (cached_data.display_instrument == nullptr || cached_data.display_instrument->empty()) 
             ? instrument_id : *cached_data.display_instrument;
         
-        auto old_it = last_snapshots.find(instrument_id);
-        if (old_it != last_snapshots.end()) {
-            // 计算 Diff 并直接写入 Writer
+        if (diff_entry.old_data != nullptr) {
+            // 计算 Diff 并直接写入 Writer（使用缓存的旧数据指针）
             writer.Key(display_instrument.c_str());
-            compute_struct_diff(old_it->second, cached_data.data, writer);
+            compute_struct_diff(*diff_entry.old_data, cached_data.data, writer);
             has_content = true;
         } else {
-            // 全量 - 这里暂时混合使用 struct_to_json (DOM) 然后 Accept 到 Writer
-            // 理想情况是 struct_to_json 也重构为 Writer 模式
+            // 全量 - 使用Writer模式（优化：避免DOM构建）
             writer.Key(display_instrument.c_str());
-            rapidjson::Value full_val = struct_to_json(cached_data.data, allocator);
-            full_val.Accept(writer);
+            struct_to_writer(cached_data.data, writer);
             has_content = true;
         }
     }
@@ -1523,8 +1641,7 @@ size_t MarketDataServer::send_diff_snapshot(
     writer.EndArray(); // End data array
     writer.EndObject(); // End root object
     
-    // 如果没有实际内容（理论上 diff_instruments 不空就不会发生，除非 compute_struct_diff 全空），
-    // 但前面已有 has_struct_changes 检查，所以这里应该总是有内容。
+    // 如果没有实际内容（理论上 diff_entries 不空就不会发生，除非 compute_struct_diff 全空）
     if (has_content) {
         session->send_message(buffer.GetString());
     } else {
@@ -1532,7 +1649,7 @@ size_t MarketDataServer::send_diff_snapshot(
         pending_peek_sessions_.insert(session->get_session_id());
     }
     
-    return diff_instruments.size();
+    return diff_entries.size();
 }
 
 void MarketDataServer::update_session_state(

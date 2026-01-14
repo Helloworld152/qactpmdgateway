@@ -186,9 +186,13 @@ public:
                                                      const std::string& display_instrument,
                                                      const uint64_t cur_time);
     
-    // 从MarketDataStruct构建JSON（用于发送）
+    // 从MarketDataStruct构建JSON（用于发送，DOM模式，保留用于兼容）
     static rapidjson::Value struct_to_json(const MarketDataStruct& data,
                                           rapidjson::Document::AllocatorType& allocator);
+    
+    // 从MarketDataStruct直接写入Writer（SAX模式，性能更优）
+    template<typename Writer>
+    static void struct_to_writer(const MarketDataStruct& data, Writer& writer);
     
     // 快速检查结构体是否有差异（避免无差异时构建JSON）
     static bool has_struct_changes(const MarketDataStruct& old_data, const MarketDataStruct& new_data);
@@ -230,6 +234,7 @@ private:
         const std::string* display_instrument = nullptr;
         uint64_t version = 0;
         bool has_data = false;
+        int index = -1;  // 用于批量获取display_instrument
     };
 
     // handle_peek_message 的辅助函数
