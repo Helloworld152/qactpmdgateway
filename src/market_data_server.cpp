@@ -787,9 +787,12 @@ void MarketDataServer::compute_struct_diff(const MarketDataStruct& old_data,
 
 void MarketDataSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthMarketData)
 {
+    using clock = std::chrono::steady_clock;
+    const auto start = clock::now();
+    
     if (!pDepthMarketData) return;
 
-    auto cur_time = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto cur_time = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
     std::string instrument_id = pDepthMarketData->InstrumentID;
     
@@ -803,9 +806,20 @@ void MarketDataSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthM
     
     // 缓存行情数据（使用结构体存储）
     server_->cache_market_data(instrument_id, market_data, display_instrument);
-    
-    // 通知线性合约管理器组件行情更新（使用结构体传递）
-    server_->on_component_update(instrument_id, market_data);
+
+    const auto end = clock::now();
+    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+
+    static std::atomic<uint64_t> total_ns{0};
+    static std::atomic<uint64_t> call_count{0};
+
+    total_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+    const auto count = call_count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    if ((count % 1000) == 0) {                 // 任意输出周期
+        const auto avg_ns = total_ns.load(std::memory_order_relaxed) / count;
+        server_->log_info("OnRtnDepthMarketData avg cost: " + std::to_string(avg_ns) + " ns (" + std::to_string(count) + " calls)");
+    }
 }
 
 void MarketDataSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast)
@@ -1422,8 +1436,8 @@ void MarketDataServer::handle_peek_message(const std::string& session_id)
     } else {
         size_t diff_count = send_diff_snapshot(session_ptr, updated_instruments, last_snapshots);
         const auto end_time = clock::now();
-        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        BOOST_LOG_TRIVIAL(info) << "peek_message processing time: " << elapsed_ms << " ms, diff instrument count: " << diff_count;
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+        BOOST_LOG_TRIVIAL(info) << "peek_message processing time: " << elapsed_ms << " ns, diff instrument count: " << diff_count;
     }
 
     // 6. 更新 Session 状态
