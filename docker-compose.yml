@@ -1,0 +1,12 @@
+services:
+  market-data-gateway:
+    build: .
+    container_name: qactpmdgateway
+    restart: unless-stopped
+    ports:
+      - "7899:7899"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    environment:
+      - LD_LIBRARY_PATH=/app/libs:/usr/local/lib

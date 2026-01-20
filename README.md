@@ -2,6 +2,56 @@
 
 基于 CTP（中金所期货行情接口）的高性能市场数据网关服务，提供实时行情数据转发和分发功能。
 
+## Docker 部署
+
+### 快速开始
+
+```bash
+# 构建并启动
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f
+
+# 停止
+docker-compose down
+```
+
+### 手动构建运行
+
+```bash
+# 构建
+./docker-build.sh
+
+# 运行
+docker run -d \
+  --name qactpmdgateway \
+  -p 7899:7899 \
+  -v $(pwd)/config:/app/config:ro \
+  -v $(pwd)/logs:/app/logs \
+  qactpmdgateway:latest
+
+# 停止并删除
+docker rm -f qactpmdgateway
+```
+
+### 常见问题
+
+**权限错误：**
+```bash
+sudo usermod -aG docker $USER && newgrp docker
+```
+
+**端口/容器冲突：**
+```bash
+docker rm -f qactpmdgateway  # 删除旧容器
+```
+
+**说明：**
+- 配置文件：`config/`（只读）
+- 日志目录：`logs/`
+- WebSocket 端口：7899
+
 ## 核心功能
 
 ### 1. 多CTP连接管理

@@ -1,0 +1,43 @@
+# 构建产物（构建时会重新生成，但构建阶段需要）
+build/
+obj/
+*.o
+*.a
+
+# 日志文件
+logs/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# 临时文件
+*.tmp
+*.bak
+*.tar.gz
+open-ctp-mdgateway/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 文档
+README.md
+docs/
+
+# Shell脚本（构建时不需要）
+shells/
